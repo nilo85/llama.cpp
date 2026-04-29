@@ -4,6 +4,9 @@ ARG ONEAPI_VERSION=2025.3.3-0-devel-ubuntu24.04
 
 FROM intel/deep-learning-essentials:$ONEAPI_VERSION AS build
 
+SHELL ["/bin/bash", "-c"]
+
+
 ARG GGML_SYCL_F16=OFF
 ARG LEVEL_ZERO_VERSION=1.28.2
 ARG LEVEL_ZERO_UBUNTU_VERSION=u24.04
