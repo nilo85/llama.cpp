@@ -8,6 +8,10 @@ SHELL ["/bin/bash", "-c"]
 
 
 ARG GGML_SYCL_F16=OFF
+ARG GGML_SYCL_GRAPH=ON
+ARG GGML_SYCL_HOST_MEM_FALLBACK=ON
+ARG GGML_SYCL_DNN=ON
+ARG GGML_SYCL_DEVICE_ARCH=
 RUN apt-get update && \
     apt-get install -y git libssl-dev
 
@@ -15,12 +19,12 @@ WORKDIR /app
 
 COPY . .
 
-RUN if [ "${GGML_SYCL_F16}" = "ON" ]; then \
-        echo "GGML_SYCL_F16 is set" \
-        && export OPT_SYCL_F16="-DGGML_SYCL_F16=ON"; \
+RUN OPT_SYCL_ARGS="-DGGML_SYCL=ON -DGGML_SYCL_F16=${GGML_SYCL_F16} -DGGML_SYCL_GRAPH=${GGML_SYCL_GRAPH} -DGGML_SYCL_HOST_MEM_FALLBACK=${GGML_SYCL_HOST_MEM_FALLBACK} -DGGML_SYCL_DNN=${GGML_SYCL_DNN}" && \
+    if [ -n "${GGML_SYCL_DEVICE_ARCH}" ]; then \
+        OPT_SYCL_ARGS="${OPT_SYCL_ARGS} -DGGML_SYCL_DEVICE_ARCH=${GGML_SYCL_DEVICE_ARCH}"; \
     fi && \
     echo "Building with dynamic libs" && \
-    cmake -B build -DGGML_NATIVE=OFF -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_BUILD_TESTS=OFF ${OPT_SYCL_F16} && \
+    cmake -B build -DGGML_NATIVE=OFF -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_BUILD_TESTS=OFF ${OPT_SYCL_ARGS} && \
     cmake --build build --config Release -j$(nproc)
 
 RUN mkdir -p /app/lib && \
