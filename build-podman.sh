@@ -4,7 +4,7 @@
 # sudo podman build --format docker -t llama.cpp:full-intel --build-arg GGML_SYCL_F16=ON --build-arg GGML_SYCL_DEVICE_ARCH=bmg  --target full -f .devops/intel.Dockerfile .
 
 
-sudo podman build --format docker -t llama.cpp:full-intel \
+sudo podman build --format docker -t llama.cpp:full-intel-extras \
   --build-arg GGML_SYCL_F16=ON \
   --build-arg GGML_SYCL_DEVICE_ARCH=bmg \
   --target full -f .devops/intel.Dockerfile .
