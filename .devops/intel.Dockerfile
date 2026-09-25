@@ -21,6 +21,8 @@ RUN LLAMA_BUILD_NUMBER="$APP_VERSION" npm run build
 
 FROM docker.io/intel/deep-learning-essentials:$ONEAPI_VERSION AS build
 
+SHELL ["/bin/bash", "-c"]
+
 ARG GGML_SYCL_F16=ON
 ARG LEVEL_ZERO_VERSION=1.28.2
 ARG LEVEL_ZERO_UBUNTU_VERSION=u24.04
