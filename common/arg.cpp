@@ -2754,6 +2754,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_OVERRIDE_TENSOR"));
     add_opt(common_arg(
+        {"--dump-routing"}, "<file>",
+        "dump per-layer MoE expert routing to FILE (calibration trace for -ot generation)",
+        [](common_params & params, const std::string & value) {
+            params.dump_routing = value;
+        }
+    ).set_env("LLAMA_ARG_DUMP_ROUTING"));
+    add_opt(common_arg(
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",
         [](common_params & params) {

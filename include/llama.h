@@ -392,6 +392,9 @@ extern "C" {
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
 
+        // optional: dump per-layer MoE expert routing to FILE (calibration trace, one line per MoE layer per step)
+        const char * dump_routing;
+
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 

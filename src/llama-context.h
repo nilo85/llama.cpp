@@ -12,7 +12,9 @@
 #include "ggml-opt.h"
 
 #include <array>
+#include <fstream>
 #include <map>
+#include <utility>
 #include <vector>
 
 struct llama_model;
@@ -271,6 +273,9 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
+    // read back the captured ffn_moe_topk tensors and append the per-layer expert counts to the trace file
+    void routing_trace_flush();
+
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
@@ -289,6 +294,11 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+
+    // MoE routing trace (cparams.dump_routing): ffn_moe_topk nodes captured at graph build,
+    // read back after each compute; mutable because graph_get_cb() is const
+    std::ofstream routing_trace;
+    mutable std::vector<std::pair<int, ggml_tensor *>> routing_captures;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
