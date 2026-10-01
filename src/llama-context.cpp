@@ -1436,6 +1436,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        if (!cparams.dump_routing.empty()) {
+            for (const auto & cap : routing_captures) {
+                if (cap.second && ggml_graph_size(gf) > ggml_graph_n_nodes(gf)) {
+                    // keep the routing tensor alive until after the graph compute so the trace reads valid data
+                    ggml_graph_add_node(gf, cap.second);
+                }
+            }
+        }
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -2647,19 +2656,28 @@ void llama_context::routing_trace_flush() {
     std::vector<int32_t> buf;
     for (const auto & cap : routing_captures) {
         ggml_tensor * t = cap.second;
-        if (t == nullptr) {
+        if (t == nullptr || t->type != GGML_TYPE_I32) {
             continue;
         }
-        const size_t nbytes = ggml_nbytes(t);
-        buf.resize(nbytes / sizeof(int32_t));
-        ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
+
+        const int64_t n0 = t->ne[0];
+        buf.resize(n0);
 
         std::map<int32_t, int64_t> counts;
-        for (const int32_t e : buf) {
-            if (e >= 0) {
-                counts[e]++;
+        for (int64_t i3 = 0; i3 < t->ne[3]; i3++) {
+            for (int64_t i2 = 0; i2 < t->ne[2]; i2++) {
+                for (int64_t i1 = 0; i1 < t->ne[1]; i1++) {
+                    const size_t off = i1*t->nb[1] + i2*t->nb[2] + i3*t->nb[3];
+                    ggml_backend_tensor_get(t, buf.data(), off, n0*sizeof(int32_t));
+                    for (const int32_t e : buf) {
+                        if (e >= 0) {
+                            counts[e]++;
+                        }
+                    }
+                }
             }
         }
+
         routing_trace << "il=" << cap.first;
         for (const auto & kv : counts) {
             routing_trace << " " << kv.first << ":" << kv.second;
