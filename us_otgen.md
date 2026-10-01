@@ -37,8 +37,8 @@ Tool exists in this workspace with a `--help` matching the emitted-format spec, 
 - [x] Core `--dump-routing` hook implemented, validated, pushed to `nilo85/us-otgen-router-ot`.
 
 ## TODO (per-expert placement core, branch: TBD)
-- [ ] Create/switch llama.cpp branch for per-expert core work.
-- [ ] M1: hardcoded 2-way expert split (GPU0/GPU1) for Qwen3.8-Flash-Next; validate greedy parity + perf.
+- [x] Create/switch llama.cpp branch for per-expert core work (`us-otgen-expert-ot` from `us-otgen-router-ot`).
+- [ ] M1: hardcoded 2-way expert split (GPU0/GPU1) for Qwen3.8-Flash-Next; validate greedy parity + perf. (in progress: loader + graph + Qwen4exp wiring done, compile/build/validate pending)
 - [ ] M2: CLI/file plumbing for arbitrary per-layer expert ranges and backends.
 - [ ] M3: out-of-tree trace-to-placement generator that emits the placement file.
 - [ ] M4: validation + research.md update; push branches.
@@ -81,7 +81,7 @@ Tool exists in this workspace with a `--help` matching the emitted-format spec, 
 - Cross-backend adds for the per-part outputs may add latency; the win depends on hot-expert residency.
 
 ## Work Log & Resume Context
-_State: PER-EXPERT DESIGN DRAFTED 2026-10-01; implementation starting. Update after each step (what was done, key decisions, how to verify/resume)._
+_State: PER-EXPERT M1 CODE DRAFT ON `us-otgen-expert-ot` 2026-10-01; loader, graph, and Qwen4exp wiring are in place, compile/build/validate pending. Update after each step (what was done, key decisions, how to verify/resume)._
 
 ### 2026-10-01 — Design + branch strategy (agreed with user)
 - **Goal:** replace static layer-uniform `-ot` placement with workload-calibrated expert placement. Trace per-layer MoE routing over a representative pass, rank expert hotness, solve a VRAM-budget knapsack split proportional to per-device bandwidth, emit an `-ot` pattern file.
@@ -117,3 +117,11 @@ _State: PER-EXPERT DESIGN DRAFTED 2026-10-01; implementation starting. Update af
   - `LLAMA_SPLIT_MODE_TENSOR` is disabled for `QWEN4EXP` and splits hidden axes, not the expert axis.
 - Drafted the "static expert partitioning + partial MoE subgraphs" design (see section above). It avoids backend kernel changes by partitioning the fused expert tensor into separate tensors at load time and building one masked MoE subgraph per partition in `build_moe_ffn()`.
 - **Next:** create a llama.cpp branch for the per-expert core work and start with a hardcoded 2-way expert split prototype on Qwen3.8-Flash-Next.
+
+### 2026-10-01 — Per-expert M1 code draft on `us-otgen-expert-ot`
+- Created branch `us-otgen-expert-ot` from `us-otgen-router-ot` (which already has the validated `--dump-routing` hook).
+- Loader: added `llama_model_loader::expert_part_spec` and `n_part_tensors`; `create_tensor()` now has a synthetic-part path that builds a tensor from a requested shape, names it from the part spec, forces a buffer type, and registers a synthetic weight as a byte-slice of the original GGUF tensor without incrementing `n_created`.
+- Graph: extended `build_moe_ffn()` with optional per-part expert weight/scale vectors and per-part expert offsets. When parts are present, it builds one masked MoE FFN subgraph per part (masked `ids_part`/`weights_part`, local expert remap, per-part gate/up/down + activation) and sums the per-part outputs. The normal single-tensor path now uses the same `sum_expert_rows()` helper as the partitioned path.
+- Model: Qwen4exp `load_tensors` now supports `LLAMA_EXPERT_SPLIT=K` (M1: `K=2`): it skips the original fused expert tensors, creates K byte-sliced parts for `ffn_down_exps` and `ffn_gate_up_exps`, assigns part 0 to the layer's current device and part 1 to another GPU (or CPU fallback), and stores the part vectors/offsets in `llama_layer`. `build_layer_ffn` passes those part vectors into `build_moe_ffn()`.
+- **Not yet done:** compile check, SYCL image build, correctness validation, performance validation, mmap/lazy-load guard, CLI/file plumbing, trace-to-placement generator, final `research.md` update, branch push.
+- **Next:** compile the current changes, then build the SYCL image and run a Qwen3.8-Flash-Next greedy parity test with `LLAMA_EXPERT_SPLIT=2 --no-mmap`.
