@@ -3338,7 +3338,21 @@ ggml_tensor * llama_model_base::create_expert_part(const LLM_TN_IMPL & tn, const
     return create_tensor(*ml, tn, ne, flags);
 }
 
-ggml_backend_buffer_type_t llama_model_base::get_expert_split_buft(int il, int part_idx) const {
+ggml_backend_buffer_type_t llama_model_base::get_expert_split_buft(int il, int part_idx, const std::string & part_name) const {
+    if (ml && ml->tensor_buft_overrides) {
+        for (const auto * overrides = ml->tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
+            std::regex pattern(overrides->pattern);
+            if (std::regex_search(part_name, pattern)) {
+                if (overrides->buft == ggml_backend_cpu_buffer_type()) {
+                    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                    GGML_ASSERT(cpu_dev != nullptr);
+                    return ggml_backend_dev_buffer_type(cpu_dev);
+                }
+                return overrides->buft;
+            }
+        }
+    }
+
     ggml_backend_dev_t cur_dev = pimpl->dev_layer[il].dev;
     const buft_list_t * cur_buft_list = pimpl->dev_layer[il].buft_list;
 

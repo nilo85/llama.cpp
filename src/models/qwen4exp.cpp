@@ -300,21 +300,25 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                 const int64_t e1 = (p + 1 < n_expert_parts) ? layer.ffn_expert_part_offsets[p + 1] : n_expert;
                 const int64_t n_e = e1 - e0;
 
+                const std::string down_part_name = format("%s.part%d", down_name.c_str(), p);
                 layer.ffn_down_exps_parts.push_back(create_expert_part(
                         tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_e }, 0,
-                        format("%s.part%d", down_name.c_str(), p), (size_t) e0 * down_stride, get_expert_split_buft(il, p)));
+                        down_part_name, (size_t) e0 * down_stride, get_expert_split_buft(il, p, down_part_name)));
 
                 if (has_gate_up) {
+                    const std::string gu_part_name = format("%s.part%d", gu_name.c_str(), p);
                     layer.ffn_gate_up_exps_parts.push_back(create_expert_part(
                             tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", il), { n_embd, n_ff_exp * 2, n_e }, 0,
-                            format("%s.part%d", gu_name.c_str(), p), (size_t) e0 * gu_stride, get_expert_split_buft(il, p)));
+                            gu_part_name, (size_t) e0 * gu_stride, get_expert_split_buft(il, p, gu_part_name)));
                 } else {
+                    const std::string gate_part_name = format("%s.part%d", gate_name.c_str(), p);
+                    const std::string up_part_name   = format("%s.part%d", up_name.c_str(), p);
                     layer.ffn_gate_exps_parts.push_back(create_expert_part(
                             tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", il), { n_embd, n_ff_exp, n_e }, 0,
-                            format("%s.part%d", gate_name.c_str(), p), (size_t) e0 * gate_stride, get_expert_split_buft(il, p)));
+                            gate_part_name, (size_t) e0 * gate_stride, get_expert_split_buft(il, p, gate_part_name)));
                     layer.ffn_up_exps_parts.push_back(create_expert_part(
                             tn(LLM_TENSOR_FFN_UP_EXPS, "weight", il), { n_embd, n_ff_exp, n_e }, 0,
-                            format("%s.part%d", up_name.c_str(), p), (size_t) e0 * up_stride, get_expert_split_buft(il, p)));
+                            up_part_name, (size_t) e0 * up_stride, get_expert_split_buft(il, p, up_part_name)));
                 }
             }
 
