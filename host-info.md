@@ -244,6 +244,93 @@ image = ghcr.io/ggml-org/llama.cpp:full-intel
 So if you benchmark `master-fresh`, you are benchmarking something production is
 not serving. State which image produced any number you report.
 
+### Path D — fast oneAPI container compile check (✅ verified 2026-10-01)
+
+Use this when the host has no `cmake`/`ninja` on PATH and you only need to
+validate C++ changes before starting a long SYCL image build. It does **not**
+use the GPUs and does **not** produce a runnable SYCL binary.
+
+```bash
+podman run --rm \
+  -v /home/niklas/workspace/llama.cpp:/src \
+  -v /tmp/opencode/llama-build:/build \
+  -w /src \
+  docker.io/intel/oneapi-toolkit:2026.1.1-devel-ubuntu24.04 bash -lc '
+  source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true
+  cmake -S /src -B /build -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
+    -DGGML_SYCL=OFF -DGGML_VULKAN=OFF -DGGML_CUDA=OFF -DGGML_HIP=OFF
+  cmake --build /build --target llama -j"$(nproc)"
+'
+```
+
+Notes:
+- The image tag is `2026.1.1-devel-ubuntu24.04`, not `2026.1.1-devel`.
+- `source /opt/intel/oneapi/setvars.sh` can return non-zero; use `|| true`.
+- This CMake tree does not use `BUILD_TESTS` / `BUILD_EXAMPLES` / `BUILD_TOOLS`;
+  omit those variables unless you check the current option names first.
+- For a faster single-file syntax check, run:
+  `icpx -fsyntax-only -std=c++17 -I include -I src -I ggml/include <file.cpp>`
+  inside the same container.
+- Use Path C for a standalone image, but do **not** use Path C for normal
+  iteration between code changes.
+
+### Path E — fast SYCL iteration from a mounted build dir (use this for code changes)
+
+`build-podman.sh` bakes the binaries into a new image. That is wasteful when
+iterating. For run-between-changes work, use an existing SYCL-capable image only
+as the toolchain/runtime container, mount the source tree and a persistent build
+dir, and rebuild/run the binaries from the mounted build dir.
+
+For the `us-otgen-expert-ot` branch, use:
+
+```bash
+BUILD_DIR=/home/niklas/sycl-build-otgen-expert
+mkdir -p "$BUILD_DIR"
+
+# configure + incremental build
+sudo podman run --rm --entrypoint bash \
+  -v /home/niklas/workspace/llama.cpp:/src \
+  -v "$BUILD_DIR":/build \
+  -w /src \
+  localhost/llama.cpp:us-otgen-expert-ot \
+  -lc '
+  source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true
+  cmake -S /src -B /build -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
+    -DGGML_SYCL=ON -DGGML_SYCL_F16=ON -DGGML_SYCL_DEVICE_ARCH=bmg \
+    -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_BUILD_TESTS=OFF
+  cmake --build /build --target llama-cli -j"$(nproc)"
+'
+```
+
+Run the mounted binary with GPUs:
+
+```bash
+sudo podman run --rm --entrypoint bash \
+  -e ZES_ENABLE_SYSMAN=1 \
+  -v /home/niklas/workspace/llama.cpp:/src \
+  -v /home/niklas/sycl-build-otgen-expert:/build \
+  -v /root/.cache/huggingface/hub:/root/.cache/huggingface/hub:Z \
+  --device=/dev/dri/renderD129 --device=/dev/dri/renderD130 \
+  localhost/llama.cpp:us-otgen-expert-ot \
+  -lc '/build/bin/llama-cli ...'
+```
+
+Notes:
+- The llama.cpp podman image has `ENTRYPOINT ["/app/tools.sh"]`, so mounted-build
+  iteration must use `--entrypoint bash`; otherwise `bash` is parsed as a
+  `tools.sh` argument.
+- `-hf` may print `HTTPS is not supported` in these container builds. If the
+  model is already cached, it can still load, but for cleaner tests use the
+  direct cached GGUF path under
+  `/root/.cache/huggingface/hub/models--unsloth--Qwen3.8-Flash-Next-GGUF/snapshots/.../UD-Q3_K_XL/...`.
+- The first mounted SYCL build is still a full build; only **subsequent**
+  changes are fast incremental builds.
+- The image’s `/app` binaries may be stale; that is fine. Use the image for
+  oneAPI + NEO/Level Zero runtime libraries, and run `/build/bin/llama-cli`.
+- Use Path C only when a standalone image is actually needed.
+
 ---
 
 ## 5. Running it
