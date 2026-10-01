@@ -38,10 +38,15 @@ Tool exists in this workspace with a `--help` matching the emitted-format spec, 
 
 ## TODO (per-expert placement core, branch: TBD)
 - [x] Create/switch llama.cpp branch for per-expert core work (`us-otgen-expert-ot` from `us-otgen-router-ot`).
-- [ ] M1: env-driven K-way expert split for Qwen3.8-Flash-Next; validate greedy parity + perf. On this rig use `LLAMA_EXPERT_SPLIT=3` (GPU/GPU/CPU) for capacity; a 2-way all-GPU split does not fit the ~90GB Q3_K_XL model.
-- [ ] M2: CLI/file plumbing for arbitrary per-layer expert ranges and backends.
-- [ ] M3: out-of-tree trace-to-placement generator that emits the placement file.
-- [ ] M4: validation + research.md update; push branches.
+- [x] M1: env-driven K-way expert split for Qwen3.8-Flash-Next; validate greedy parity + perf on Q2_K_XL. Q3_K_XL K=8 proves capacity; uniform K=3 is not the right capacity path on this rig.
+- [x] M2: `-ot` override plumbing for synthetic `.partN` expert tensors. Arbitrary per-layer contiguous ranges are still future work, but generated placement can now use existing `-ot` patterns.
+- [x] M3: out-of-tree trace-to-placement generator that emits `-ot` patterns from `--dump-routing` traces.
+- [ ] M4: stronger validation + research.md update; push branches. First Q3 generated-placement win is recorded, but needs a better baseline and trace from Q3 itself.
+- [ ] M5 (local-only placement): change generator policy so a layer's hot parts go to its owning GPU and everything else goes to CPU (never the remote GPU); A/B vs current remote-spill. This is the in-line next step, not a detour.
+- [ ] M6 (DEFERRED, low priority): global expert-index tiering (hottest experts' all-layer weights on GPU1, moderate GPU2, cold CPU). Checked 2026-10-01 against our traces: per-layer top-set overlap is ~chance (1.06-1.19x), so hotness is per-layer-scattered, not index-consistent; the mild global skew (top-10% holds ~21% mass) can't be placed without fighting the layer split. Revisit only if a future model shows index-consistent hotness or we drop the layer split.
+- [x] M7 (workload/persona-adaptive traces) VALIDATED 2026-10-01: 3 prompts x 4 personas (coder/reporter/toolcaller/chat), Q3, medium prompts, single-GPU. Per-layer top-set: within-persona Jaccard `0.470` (9.0x chance) vs between-persona `0.152` (2.9x) at top-10%; `0.568` (4.0x) vs `0.302` (2.1x) at top-25%. Personas are a real, robust placement axis (not one-prompt noise). Within-persona union ~1.6x K (stable); cross-persona union ~4.2x K at top-10% (~42% of a layer's experts) and ~2.8x at top-25% (~69%, at/over the Q3 capacity wall). Toolcaller traces thinner (short JSON, ~20-35 steps) -> noisier, but contrast holds.
+- [x] M8 (decided 2026-10-01): user's real mix is tool-caller + coder + reasoning (not reporter/chat). 3-persona cross-union = 179 experts (35% of a layer) at top-10%, 321 (63%) at top-25%. 35% is under the 50% that already loaded on Q3 (K=8 hot-50), so a single union-default file fits at a tight hot-fraction; 63% is over the wall. Plan: ship a union-default (3 personas) + per-persona files, switched per session (static-but-calibrated "dynamic"; runtime migration stays out of scope). Caveat: scattered union-hot vs contiguous parts -> higher K for cleaner fit (K-vs-overhead knob).
+- [ ] M9 (build): emit the union-default `-ot` from the 3-persona traces using the M5 local-only policy; A/B vs uniform K=8 and vs a single-persona file. Tune K + hot-fraction for the fit/overhead tradeoff.
 - [x] Add `--dump-routing FILE`: arg.cpp (next to `-ot` :2752) + common.h `common_params` + common.cpp cparams plumbing + `include/llama.h` (public `const char *`) + `src/llama-cparams.h` (internal `std::string`).
 - [x] Core hook: in `graph_get_cb`, capture `ffn_moe_topk` tensors when the flag is set (mutable vector, re-captured on graph rebuild); after `graph_compute` (`:1456`) `routing_trace_flush()` reads back via `ggml_backend_tensor_get`, counts per-layer expert hits, appends one line per MoE layer per step to FILE.
 - [x] Build SYCL on `us-otgen-router-ot` - verify compiles + emits a trace.
@@ -83,7 +88,7 @@ Tool exists in this workspace with a `--help` matching the emitted-format spec, 
 - Cross-backend adds for the per-part outputs may add latency; the win depends on hot-expert residency.
 
 ## Work Log & Resume Context
-_State: PER-EXPERT M1 VALIDATION DONE ON `us-otgen-expert-ot` 2026-10-01; loader, graph, and Qwen4exp wiring are in place. Q2_K_XL K=2 passes single-GPU, dual-GPU, and greedy parity/perf against the unsplit `-cmoe` path. Q3_K_XL K=8 proves capacity but is too slow for practical use. Pushed to `nilo85` at `6a9e94689`. Next is M2 placement-file plumbing or the trace-to-placement generator._
+_State: PER-EXPERT M1, `-ot` PART-OVERRIDE HOOK, AND TRACE-TO-`-ot` GENERATOR DONE ON `us-otgen-expert-ot` 2026-10-01. Q2_K_XL K=2 passes parity/perf; Q3_K_XL K=8 capacity passes; Q3-trace K=8 hot-50 `-ot` placement beats uniform K=8 (`9.4 pp / 4.2 tg` vs `5.8 pp / 3.4 tg`). Core pushed to `nilo85` at `d49a538df`. Global expert-index tiering set aside as ghost (M6 deferred). Persona/workload traces VALIDATED as a real, robust axis (M7: within-persona 9x chance vs between 2.9x). Next: M8 decision (per-persona `-ot` files vs union) + M5 local-only placement + A/B._
 
 ### 2026-10-01 — Design + branch strategy (agreed with user)
 - **Goal:** replace static layer-uniform `-ot` placement with workload-calibrated expert placement. Trace per-layer MoE routing over a representative pass, rank expert hotness, solve a VRAM-budget knapsack split proportional to per-device bandwidth, emit an `-ot` pattern file.
@@ -218,3 +223,56 @@ _State: PER-EXPERT M1 VALIDATION DONE ON `us-otgen-expert-ot` 2026-10-01; loader
 - Restarted `podman-llama-cpp-qwen3.8-27b.service` after the test.
 - Conclusion: uniform K=8 proves the Q3 capacity path can load and run on this rig, but it is not a practical Q3 performance config. The next useful step is routing-aware placement with smaller hot-expert GPU ranges instead of uniform all-GPU-layer K-way splitting.
 - **Next:** move to M2 placement-file plumbing or the out-of-tree trace-to-placement generator.
+
+### 2026-10-01 - `-ot` can now target synthetic expert parts
+- Added a small core hook: `llama_model_base::get_expert_split_buft()` checks `tensor_buft_overrides` for the synthetic part name before falling back to the uniform `LLAMA_EXPERT_SPLIT` placement rule.
+- Qwen4exp now passes the synthetic part name (`...partN`) when selecting the expert-part buffer type.
+- Built `llama-cli` in `/home/niklas/sycl-build-otgen-expert`.
+- Single-GPU Q2_K_XL test on `renderD130` with `LLAMA_EXPERT_SPLIT=2` and `-ot 'blk.1.ffn_down_exps.weight.part0=CPU'` plus matching gate/up overrides moved layer 1 part 0 to CPU in the debug log and still generated coherent text.
+- Pushed `us-otgen-expert-ot` to `nilo85` at `d49a538df`.
+- This makes the existing `-ot` mechanism usable by the out-of-tree trace-to-placement generator for uniform K-way expert parts.
+
+### 2026-10-01 - Trace-to-`-ot` generator implemented and first Q3 win
+- Added out-of-tree generator: `/home/niklas/b70_opt/generate_expert_ot.py`.
+- It parses `--dump-routing` traces, aggregates per-layer expert hits, ranks contiguous `.partN` expert ranges, and emits `-ot` patterns for synthetic expert parts.
+- Generated a Q2 routing trace on `renderD130` while the 27B service stayed up:
+  - trace: `/tmp/opencode/routing-trace-q2.txt`
+  - prompt: LRU cache coding question, 128 generated tokens, 48 MoE layers, 6288 trace data lines.
+- Generated placement:
+  - file: `/tmp/opencode/placement-q2-k8-hot50.ot`
+  - shell helper: `/tmp/opencode/placement-q2-k8-hot50-args.sh`
+  - `K=8`, `hot-fraction=0.5`, `prefer-local`, `SYCL0/SYCL1=50/50`, separate gate/up layout.
+- Q2_K_XL dual-GPU with generated K=8 hot-50 placement:
+  - log: `/tmp/opencode/otgen-placement-q2-k8-hot50-dual-gpu.log`
+  - `8.5 pp / 4.6 tg`.
+  - This is slower than uniform K=2 (`31.1 pp / 18.1 tg`) because Q2 can keep all experts on GPU; the generated K=8 placement is mainly useful when all experts do not fit.
+- Q3_K_XL dual-GPU with the same generated K=8 hot-50 placement:
+  - log: `/tmp/opencode/otgen-placement-q3-k8-hot50-dual-gpu.log`
+  - `7.2 pp / 3.9 tg`.
+  - This beats the uniform K=8 Q3 capacity run (`5.8 pp / 3.4 tg`) by about `24% pp` and `15% tg` in this bounded prompt.
+- Restarted `podman-llama-cpp-qwen3.8-27b.service` after the dual-GPU test window.
+- Generated a Q3 routing trace on `renderD130` while the 27B service stayed up:
+  - trace: `/tmp/opencode/routing-trace-q3.txt`
+  - prompt: LRU cache coding question, 64 generated tokens, 48 MoE layers, 3216 trace data lines.
+- Q3_K_XL dual-GPU with Q3-trace K=8 hot-50 placement:
+  - log: `/tmp/opencode/otgen-placement-q3trace-k8-hot50-dual-gpu.log`
+  - `9.4 pp / 4.2 tg`.
+  - This beats the Q2-trace placement (`7.2 pp / 3.9 tg`) and uniform K=8 (`5.8 pp / 3.4 tg`), so the trace-to-`-ot` path is working and model-specific traces matter.
+- Restarted `podman-llama-cpp-qwen3.8-27b.service` after the dual-GPU test window.
+- **Next:** implement M5 (local-only placement) and A/B it; then compare against a practical Q3 CPU-expert baseline rather than uniform K=8 only.
+
+### 2026-10-01 - Global expert-index tiering checked: mostly a ghost
+- User proposed a new split axis: put the globally hottest experts' all-layer weights on GPU1, moderate on GPU2, cold on CPU, so the hottest compute never leaves GPU1.
+- Ran a cheap, no-GPU check on the traces we already had (`/tmp/opencode/check_hotness_consistency.py` over the Q2+Q3 routing traces):
+  - Per-layer top-set overlap is ~chance: top-10% mean pairwise Jaccard `0.062` vs chance `0.052` (1.19x); top-25% `0.152` vs `0.143` (1.06x). Hot experts are per-layer-scattered, not index-consistent across layers.
+  - There is a mild global skew (global top-10% holds `21.3%` of routing mass, ~2x uniform), but those experts sit at mean per-layer rank ~119/512 and land in a layer's top tier only ~16% of the time. In a layer split, GPU1 only runs layers 24-47, so globally-hot weights in layers 0-23 would sit on GPU1 but be used by GPU0, reintroducing the cross-device traffic we want to remove.
+- Verdict: the premise (index-consistent hotness) does not hold; the small real skew is not placeable without fighting the layer boundary. Logged as deferred M6. Per-layer-local (M5) stays the policy.
+
+### 2026-10-01 - Persona/workload traces: real, robust signal (M7 validated)
+- User hypothesis: different "personas" (coder vs reporter vs tool-caller) route to different experts, so traces should use varied persona prompts and placement could be per-persona.
+- Design (to defeat one-prompt noise): 3 medium prompts per persona x 4 personas = 12 Q3 traces, single-GPU `-cmoe -ngl 2`, same greedy seed, 27B stayed up. Runner `/tmp/opencode/run_persona_traces.sh`, analyzer `/tmp/opencode/check_persona_overlap.py`, log `/tmp/opencode/otgen-persona-traces.log`.
+- GPU behavior during runs (user-asked): 95% util but 87W/18% eff and only ~1.9GiB VRAM is the expected signature of a CPU-bound `-cmoe` run (2 sidecar layers on GPU, ~85GB experts on CPU, GPU mostly stalling). Trace validity unaffected.
+- Result (per-layer top-set Jaccard): within-persona `0.470` (9.0x chance) vs between-persona `0.152` (2.9x) at top-10%; `0.568` (4.0x) vs `0.302` (2.1x) at top-25%. Within >> between => persona effect is real and stable, not noise.
+- Unions: within-persona ~1.6x K (a persona is stable); cross-persona ~4.2x K at top-10% (~42% of a layer's experts), ~2.8x at top-25% (~69%, at/over the Q3 capacity wall) => a full 4-persona union likely OOMs; per-persona is the VRAM-safe path.
+- Caveat: toolcaller outputs are short JSON (~20-35 traced steps vs ~131 for prose personas) so its hot set is noisier, but the within/between contrast still holds.
+- **Next:** M8 decision (per-persona files vs union) based on the user's real workload mix; then feed the chosen persona's traces into the M5 local-only generator.
