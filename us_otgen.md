@@ -83,7 +83,7 @@ Tool exists in this workspace with a `--help` matching the emitted-format spec, 
 - Cross-backend adds for the per-part outputs may add latency; the win depends on hot-expert residency.
 
 ## Work Log & Resume Context
-_State: PER-EXPERT M1 VALIDATION + SINGLE-GPU PARITY PASSED ON `us-otgen-expert-ot` 2026-10-01; loader, graph, and Qwen4exp wiring are in place. Q2_K_XL K=2 passes single-GPU `-ngl 2`, dual-GPU `-ngl 48`, and single-GPU greedy parity against the unsplit path. Pushed to `nilo85` at `6a9e94689`. Next is dual-GPU parity/perf or Q3 / routing-aware placement._
+_State: PER-EXPERT M1 DUAL-GPU Q2 PARITY/PERF PASSED ON `us-otgen-expert-ot` 2026-10-01; loader, graph, and Qwen4exp wiring are in place. Q2_K_XL K=2 passes single-GPU `-ngl 2`, dual-GPU `-ngl 48`, single-GPU greedy parity, and dual-GPU greedy parity/perf against the unsplit `-cmoe` path. Pushed to `nilo85` at `6a9e94689`. Next is Q3 capacity validation or routing-aware placement._
 
 ### 2026-10-01 — Design + branch strategy (agreed with user)
 - **Goal:** replace static layer-uniform `-ot` placement with workload-calibrated expert placement. Trace per-layer MoE routing over a representative pass, rank expert hotness, solve a VRAM-budget knapsack split proportional to per-device bandwidth, emit an `-ot` pattern file.
@@ -196,3 +196,18 @@ _State: PER-EXPERT M1 VALIDATION + SINGLE-GPU PARITY PASSED ON `us-otgen-expert-
 - This is the first correctness parity result for the per-expert split path.
 - Pushed `us-otgen-expert-ot` to `nilo85` at commit `6a9e94689` after changing the temporary expert-part log to debug level and cleaning the graph signature indentation.
 - **Next:** run a bounded dual-GPU parity/perf comparison or move to Q3_K_XL / routing-aware placement.
+
+### 2026-10-01 - Dual-GPU Q2 K=2 parity/perf passed
+- Ran a bounded dual-GPU Q2_K_XL comparison while `podman-llama-cpp-qwen3.8-27b.service` was stopped.
+- Baseline no-split path used `-cmoe` to keep experts on CPU:
+  - log: `/tmp/opencode/otgen-expert-split-parity-dual-gpu-q2-ns-cmoe.log`
+  - output: `A GPU is a specialized electronic circuit designed to rapidly manipulate and alter memory to accelerate the`
+  - timings: `19.8 t/s` prompt, `13.3 t/s` generation.
+- Split path used `LLAMA_EXPERT_SPLIT=2` and omitted `-cmoe`:
+  - log: `/tmp/opencode/otgen-expert-split-parity-dual-gpu-q2-k2-split.log`
+  - output matched the baseline text exactly.
+  - timings: `31.1 t/s` prompt, `18.1 t/s` generation.
+- Common flags: `-ngl 48`, `--split-mode layer`, `--tensor-split 50,50`, `--fit off`, `--ctx-size 4096`, `-n 32`, `-np 1`, `--temp 0`, `-s 1`, `-st`, `--no-display-prompt`, `--jinja`, `--reasoning off`, `-fa on`, `-ctk q4_0`, `-ctv q4_0`, `--load-mode mmap`.
+- Restarted `podman-llama-cpp-qwen3.8-27b.service` after the dual-GPU test window.
+- Conclusion: the M1 per-expert split path is correct for the Q2 greedy prefix and faster than the `-cmoe` CPU-expert baseline in this bounded dual-GPU config.
+- **Next:** validate Q3_K_XL capacity path or move to routing-aware placement / trace-to-placement generator.
