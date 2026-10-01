@@ -1,0 +1,297 @@
+# Qwen3.8-Flash-Next on 2× Intel Arc Pro B70 — Research Notes (LIVE DOCUMENT)
+
+> Status: **research complete** (GitHub, HF, GGUF header, Strata docs/issues, Reddit via browser — all fetched live 2026-09-29; nothing from training memory).
+> llama.cpp mainline at research time: **b11261 / 2026-09-29**.
+
+## EXECUTIVE SUMMARY (recommended setup, details/proof in sections below)
+
+1. **OS/build:** Linux, build **llama.cpp master (≥ b11261) yourself** with **SYCL** (`-DGGML_SYCL=ON`) and a second **Vulkan** build as A/B fallback. Do **not** use prebuilt binaries (unsloth `b11160-mix` Vulkan predates the 2026-09-29 Intel GDN kernel fix #29476 → up to ~10x slower on this arch's 36 GDN layers).
+2. **Quant:** **UD-Q4_K_XL** (111.33 GB, unsloth top-1 92.26%) — fits 64 GB VRAM + 64 GB RAM *because* the ~51B-param PLE/n-gram table stays `--lazy-mode auto` (default; streams rows from NVMe via mmap) and overflow experts can go to CPU. Fallbacks: **UD-IQ4_XS** (93.68 GB) / **UD-Q3_K_XL** (90.0 GB) for extra KV/compute headroom. Skip ≤2-bit (quality goal).
+3. **Multi-GPU:** `-sm layer` **only** (never `tensor` — disabled for qwen4exp mainline #27941/#28569, dual-B70 P2P crash #27198 + RAM leak #27845). `--main-gpu 0` = the PCIe5 card; bias layers via `--tensor-split ~1.15,1` after measuring (GPU1 rides PCIe4/PCH — likely x4 ≈ 8 GB/s, activations-only traffic is tiny under layer split, so imbalance mostly costs expert-residency, calibrate). That both-GPU setup beat single+CPU helped in your asked-vs-measured cases: measure first.
+4. **Context/KV:** `-fa on` (SYCL sparse-FA merged #28796 = why B70 keeps 15.8 t/s @64K on SYCL vs 4.5 on Vulkan, #28721), `-ctk q8_0 -ctv q8_0`, start `-c 32768`, ladder to 128K as VRAM allows; `-b 2048 -ub 512` (raise `-ub` only for short-ctx benchmarking — long-ctx compute-buffer OOM trap, §6.2). `-np 1`, `-kvu`. Don't rely on `--fit` (under-accounts, #27595) — size explicitly.
+5. **Speed layer (after baseline stable):** build open PR **#28243** (Qwen3.8 MTP; shared-head borrowing) on master for the winning backend; run `-md MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf --spec-type draft-mtp --spec-draft-n-max 2` (3 for code), single stream (concurrency = net loss 0.81–0.87x). Mainline-merged #28123/#28023 alone already moved users from 108 → 183 t/s code. No-fork fallback: `--spec-type draft,ngram-mod` (skip on SYCL until #28860 scratchpad bug fixed).
+6. **Expectations (anchors §3/§6):** short-ctx tg **~35–65 t/s** plausible (B70 MoE-A3B anchor 70 t/s; Strata-tiered CPU+GPU anchor 42–56; 4×3090 llama.cpp anchor 55 pre-MTP), pp **~600–1400 t/s**; @64K SYCL ≈ 2.9x better than Vulkan today. If <20 t/s short-ctx → config wrong (PLE resident / fit undersized / tensor-split attempted), fix before blaming stack.
+7. **Known-broken → plan around:** vision/mmproj on Intel (Vulkan #29093, SYCL crash #29241) — run text-only; slot/context-restore doesn't resume GDN state on hybrid models (#28194) — agents re-prefill, use `-cram` + harness-level caching; deep-prefill multi-GPU crash class exists on CUDA (#29562) — watch, test long prompts early; Windows multi-GPU idle WB/VRAM eviction (#25646) → prefer Linux.
+8. **Strata verdict:** itself **unusable** (CUDA/HIP only, no Intel/Vulkan/SYCL path; author confirmed by asking for GPUs) but **validated the blueprint** 2–3x over llama.cpp offload (7900XTX 55 t/s vs 15–25; psaun's GGML-CPU-experiments 41.7 t/s ≥ Strata → algorithm is the win, portable ideas all transferable — see §5 mapping table: lazy PLE, CPU experts w/ overlap, int8 KV, expert-cache emulation via `-ot`, MTP+ngram speculation, agent conv-cache).
+
+## 0. Target system
+
+| Component | Spec | Notes |
+|---|---|---|
+| CPU | Intel Core Ultra 2 (exact SKU TBD) | DDR5 dual-channel → ~70–90 GB/s RAM bandwidth |
+| RAM | 64 GB DDR5 | shared with OS + CPU-expert offload |
+| GPU 0 | Intel Arc Pro B70 32 GB — PCIe 5.0 (CPU-direct) | ~64 GB/s H2D |
+| GPU 1 | Intel Arc Pro B70 32 GB — PCIe 4.0 via southbridge/PCH | possibly x4 → ~8 GB/s; verify with lspci |
+| SSD | 2 TB NVMe | PLE table streams from here |
+
+Arc Pro B70 verified facts (llama.cpp issues #28721, #26581, #27198; Reddit 1tuik6o):
+- Silicon: **Battlemage G31 (BMG-G31), Xe2**, PCI ID `8086:e223`, **32 GB GDDR6, ~608 GB/s** bandwidth, 256 EUs / 32 Xe2 cores (reddit: 2048 shader cores≈"256 EU").
+- Dense-model bandwidth ceiling on one B70: ~37 t/s for Q4_K 27B (measured 35.6 today via SYCL; achieved effective BW only ~150 GB/s of 608 → **~4x software headroom, improving**).
+- MoE-A3B sweet spot measured on B70 SYCL: **qwen35moe-35B-A3B Q4_K-M (20.8 GiB): pp512 ~977 t/s, tg ~70 t/s** full-offload (`-fa on -ctk/-ctv q8_0 -mg 1`; Atomynos_Atom, build 9468). Q4_K XL-MTP for Qwen3.6-35B on Vulkan/Windows: strong at low ctx, "dives off a cliff at higher contexts" (CoolConfusion434) — matches #28721.
+- Works on Linux (xe kernel driver, Mesa ANV Vulkan, oneAPI SYCL/LevelZero) and Windows (WDDM + Intel driver; Vulkan via Mesa-on-Windows? no — vendor Vulkan).
+
+**Total memory budget: 64 GB VRAM + 64 GB RAM ≈ 128 GB gross.**
+
+## 1. The model (verified from HF repo + GGUF header parse)
+
+`unsloth/Qwen3.8-Flash-Next-GGUF` (base: `Qwen/Qwen3.8-Flash-Next`), multimodal (image-text-to-text), license qwen-community-1.0.
+
+- GGUF arch string: **`qwen4exp`**, GGUF v3. 48 layers, hidden 2560.
+- **125B params (6B activated) + 51B n-gram "PLE" embedding + 4B MTP head.**
+- Attention hybrid, layout `12 × (3 × (Gated DeltaNet → MoE) → 1 × (Qwen Sparse Attention (QSA) → MoE))`:
+  - 36 of 48 layers are **Gated DeltaNet (GDN) linear attention** (recurrent state 128, 16 groups, conv kernel 4) — cheap at depth, no big KV.
+  - 12 of 48 layers are **QSA sparse attention**: 24 Q-heads / 2 KV-heads, head_dim 256, partial RoPE 64, indexer MQA 4 Q-heads/1 K-head (dim 128), budget 512 blocks / top_k 2048 tokens → decode cost does **not** scale linearly with context in principle.
+- MoE: **512 experts/layer, 10 routed + 1 shared active**, expert intermediate dim 640 (= 24,576 tiny experts total). `n_experts_per_tok=11` in transformers config.
+- PLE / n-gram embedding: 16 heads, offsets → **~320M rows**, `embedding_length_per_layer_input=160`; Strata calls the 4-bit table **28.8 GB**; only randomly row-accessed → kept ≥4-bit even in 1-bit quants (unsloth QA table).
+- Hyper-connections ("gated residual"): 4 branches, rank 320 → special `hc` ggml ops needed per backend (merged for CPU/Vulkan/SYCL/Metal #28901; SYCL combos #29132; vulkan fuse #29520).
+- Context: **262,144 native**, extensible to ~1M (YaRN; rope_theta 10e6, partial rotary 25%).
+- MTP: 1 extra layer (blk.48.*) trained multi-step → speculative decoding head.
+- KV: 2 KV heads × head_dim 256 × 2 (k+v) per QSA layer × 12 layers = per-token KV = 12×2×2×256×2B(f16) ≈ **24.6 KB/token f16** (≈12.3 KB q8_0) → 128K ctx ≈ 3.1 GB f16 / 1.6 GB q8_0; QSA budget keeps read-set small regardless.
+
+### Quant sizes (HF tree API) and unsloth KLD quality table
+
+| Quant | Files GB | top-1 acc % | mean KLD |
+|---|--:|--:|--:|
+| UD-IQ1_S | 72.6 | 77.33 | 0.396 |
+| UD-IQ1_M | 74.5 | 79.69 | 0.315 |
+| UD-Q2_K_XL | 78.9 | 82.72 | 0.225 |
+| UD-IQ3_XXS | 82.0 | 85.41 | 0.165 |
+| UD-Q3_K_XL | 90.0 | 88.32 | 0.107 |
+| UD-IQ4_XS | 93.7 | 89.55 | 0.084 |
+| **UD-Q4_K_XL** | **111.3** | **92.26** | **0.047** |
+| UD-Q5_K_XL | 158.3 | 93.68 | 0.030 |
+| UD-Q6_K_XL | 169.2 | 94.09 | 0.027 |
+| Q8_0 | 188.2 | 94.12 | 0.027 |
+| BF16 | 354.0 | — | — |
+
+Plus `mmproj-BF16/F16.gguf` (~0.9 GB ViT), `MTP/` heads (shared Q8_0 2.6 GB recommended; Q4_K_M 1.78 GB; BF16 bigger *and* slower per unsloth), imatrix.
+
+Unsloth HW table (RAM+VRAM total): 1-bit=75 GB, 2-bit=79, 3-bit=90, 4-bit=96–114, 5-bit=163, 8-bit=200 → **64 VRAM + 64 RAM fits up to Q4_K_XL with lazy PLE streaming + partial CPU experts; Q3_K_XL/IQ4_XS fit with margin.**
+
+Sampling (unsloth/Qwen): Thinking `temp=1.0 top_p=0.95 top_k=20 min_p=0 presence_penalty=0`; Non-thinking `temp=0.7 top_p=0.80 top_k=20 presence_penalty=1.5`; `--chat-template-kwargs '{"reasoning_effort":"xhigh|high|medium|low|none"}'`.
+
+## 2. llama.cpp mainline support status
+
+- Model support merged: **PR #27742 "model: add Qwen3.8-Flash-Next (qwen4exp)"** (2026-08-26); follow-ups #27880, #27941 (`-sm tensor` DISABLED for qwen4exp), #28023 (indexer slices; +20% pp), #28123 (recurrent-state rollback for qwen3next/qwen4exp: **+69% speculative gain for MTP-class**, 108→183 t/s reported), #28901 (hc ops CPU/Vulkan/SYCL/Metal).
+- Vulkan: **#28988 merged** (qwen4exp hc), now-good `mmq_hc`; **future: fused hc path (#29520 merged), GDN compute-shader tuning — PR #29476 MERGED 2026-09-29: Intel "pathologically slow" GDN kernel 30us→3us/op (~10x), A770 vulkan PP +26%/TG +8.4%, B580 up to +38% PP.** Any Intel Vulkan build older than 2026-09-29 runs qwen4exp much slower. Style: applies to RDNA too but biggest win Intel.
+- SYCL: **#28796 merged "[SYCL] support sparse FA"** (FA=on path works — the only backend where B70 keeps pp/tg sane at depth per #28721); #29132 merged (hc combos); dynamic batch de-split #27149 for SMoE. Open: **#29245** grouped-MoE ESIMD→**XMX GEMM** (big MoE potential), #29186 Q8_0 DMMV ESIMD (deadlocked?), #29608 bulk-upload pinned ring buffer (load time), #28803/#28189 hang investigations (Qwen3.8 FA-on/Q8 KV mentioned literature).
+- **MTP draft heads NOT in mainline**: GGUFs in `MTP/` inert on stock builds. Open: **#27836** (`--spec-type draft-mtp` qwen4exp) ← **#28243** (models: Qwen3.8-Flash-Next MTP; shared-head borrowing on top of #28097 draft-head-only unsloth layout, `-md` arg); #27608 supports `kv_w`/wkv naming along the way. → fork build or wait: **unslothai/llama.cpp** (PR #144 branch) or `danielhanchen/llama.cpp qwen4exp/mtp`.
+- Mainline speculative that DOES exist today: **`--spec-type ngram-mod`** (self-speculation using model's own ngram/PLE data! `--spec-ngram-mod-n-min/-n-max/-n-match`, b10715+; composed `draft,ngram-mod`), `ngram-mod-fut` (PR #28088 merged, parallelize +ndraft tokens); classic `draft` w/ separate model (`-md`) also works with small Qwen models. Impl: batched/seq (seq default until "burning fuse" unresolved #28090).
+- Lazy tensors for PLE: **`--lazy-mode on|auto|off` (env `LLAMA_ARG_LAZY_MODE`; default auto = lazy >4 GiB tensors)**; requires mmap; read rows on demand. Deferred improvement PRs open: #29030 (gather via direct reads — bypasses page cache, kernel-2+ patches), #29599 (`llama_prefetch_rows` API + `--prefetch-rows`); closed-unmerged prototype #28136 ((>2x prefill gain measured on GB10 with direct PLE reads)). Old flag name from early builds: `--tensor-read-lazy` (renamed; reddit-confirmed).
+- MoE/offload flags (verified in master `common/arg.cpp`): `-ot/--override-tensor <pattern>=CPU` (patterns incl. `\.ffn_(gate|up|down)_exps\.`, `\.ffn_norm\.`, `\.ssm_`, `\.v_` etc.), `-cmoe/--cpu-moe`, `-ncmoe/--n-cpu-moe N`, `--fit on/off` (auto-shrink KV/offload), `-cram/--cache-ram` + `-ctxcp` (RAM prompt cache; **hybrid models currently don't reuse state across slot-restore — SR bug #28194 open; agents re-prefill**), `-kvu/--kv-unified`, `--cache-type-k/v q4_0|q5_0|q8_0|f16`, `--load-mode mmap|mlock|mmap+mlock|dio` (no-mmap kills lazy!, dio+lazy=direct I/O streaming), `-sm none|layer|row|tensor`, `--tensor-split/-ts`, `--main-gpu/-mg`, `--no-warmup`, `--threads/-t`, `--threads-batch`.
+- Multi-GPU for qwen4exp today: **`-sm tensor` DISABLED** (#27941 — scheduler assert; re-enable **#28569 open**, byte-identical verified only via RPC+tensor). `-sm row` likewise disabled. → **`-sm layer` is the supported multi-GPU mode**; `-sm none` = first device only. RPC-backed tensor over network: PR #26610.
+- Multi-GPU prefill crash datum: **#29562** (CUDA) — 7-way layer split, deterministic GGML_ASSERT #500 (op=ADD, src0 non-contig) at fixed prompt position (20–24K tokens in 65K prompts), any build ≤b11212, FA on/off, dual+ GPU; bisect points to #27742/#27880-era masks in qwen4exp graph builds → **treat long-prefill + multi-backend druant combos as at-risk until fixed**; short ctx/single-GPU unaffected (CUDA repro, but qwen4exp graph logic shared across backends).
+
+## 3. Intel B70 backend details (the core findings)
+
+### Vulkan (Mesa ANV / vendor Vulkan)
+- qwen4exp runs (since #28988/#29520), GDN now fixed (#29476 merged) → **modern master is fine short/mid ctx**.
+- **Deep-context decode collapse ~8x on B70** (#28721, OPEN, w/ maintainer ack-ish): 1k→64k ctx: 35.6→4.5 t/s vs SYCL 38.5→15.8 t/s (2.9x better); 64k TTFT 65s SYCL vs 329s V. Cause traced: scalar FA path when `n_rows==1` (decode never uses matrix cores) + Intel Battlemage FA shader weakness; #24406 merged (use FA shader when nkid总在>319 bug), #29357 "**vulkan: Intel FA kernel for prefill**" OPEN (author has repro + pcap), #24408 deep-dive. → Vulkan = weak long-context FA on B70 today; GDN side fixed.
+- Xe2 attention tax (#26581 open): constant ~21–25 ns per KV position per full-attn layer on B70 (both backends); qwen4exp has 12 full-attn layers → 32K ctx tax ≈ 8–10 ms/token from attention alone (meaningful!); ~2.4x aggregate scaling with parallel streams (latency hiding).
+- MoE batch cliff #25356 (open): MUL_MAT_ID drops MMV kernels above **n_tokens=8** (gfx1151 measured; Intel likely similar since it's backend-side heuristic… verify) → 3x throughput cliff B=9; community patch in-thread; relevant for MTP verify batches & `-np>8`.
+- Idle VRAM eviction (Windows multi-GPU #25646 open): weights evicted from display-less secondary Intel dGPU after ~70s idle → 2 t/s first response; reproducible across dual/quad B70 & B60; became non-reproducible in one arrangement (B70 primary/desktop) @b9911; mitigation attempts: registry, keepalive pings, minor-gpu-as-display; watchdog: `vramevict-debug` observation tooling offered by OP (bNXmTNUq paste).
+- Vision broken (#29093 open): two-box repro (5070Ti OK vs B70 broken), llama-mtmd-cli qwen4exp+mmproj → garbage output w/ images on Vulkan; text-only fine; GGML_VK_DISABLE_F16=0 et al. no help; `b10991-bin-win-vulkan-x64` used. SYCL box-independent crash #29241 (0xC0000409 in vision encoder forward pass). → **text-only on Intel until fixed**.
+- Device-lost via PCIe saturation post-Qwen3.8 (#29654 open, 3090+7900XT heterogeneous, Windows): model load + heavy ctx restore → VK_ERROR_DEVICE_LOST → queued submits fail; RMA'ing 7900XT; flags big-traffic-at-depth fragility class generally.
+
+### SYCL (oneAPI / LevelZero)
+- Sparse FA (QSA) merged → **only backend where B70 deep-ctx stays usable today** (#28721's own numbers; AMD-fork-headline "SYCL unlocks fp16 sparse FA").
+- Dual-B70 `-sm tensor` **P2P crash** (#27198 OPEN, reporter root-cause analysis excellent): UR_RESULT_ERROR_DEVICE_LOST in `dev2dev_memcpy` (P2P) because **ggml SYCL VMM pools aren't peer-mapped across contexts** (per-device sycl::context ⇒ no VMM peer mapping; `can_access_peer` ≠ mapped). Verified-stable options:
+  - `-sm layer`
+  - `GGML_SYCL_DEV2DEV_MEMCPY=2` (host-staged) or `GGML_SYCL_ENABLE_VMM=0` (legacy pool) — either alone enough
+  - `UR_LOADER_USE_LEVEL_ZERO_V2=0` fixes separate kernel-launch SEGV on some configs (SYCL_EVENT=1 legacy mode)
+  - Needs IGC fix compute-runtime#995; allreduce alloc fix in-tree attempted (#29459 open) but author says peer-mapping still required; workaround #28953 merged.
+- Dual-B70 `-sm tensor` **host-RAM leak** gen-phase ~6 MB/s (#27845 open): CUPTI suspected; single-GPU/layer OK. → **stay away from tensor split until fixed** (and it's disabled for qwen4exp anyway).
+- qwen4exp specifics seen under SYCL: tensor-parallel 2-GPU small-VRAM OOM (#28100, B580 TP): no `-ot` coverage for attn/mla at TP=2 + SYCL scratch triple-buffering → workaround `-ot 'blk\.(1[3-9]|2[0-9]|3[0-5])\..*=CPU'` + `SYCL_DISABLE_GRAPH_MEM_POOL=1` / `ONEAPI_MKL_DIS_SCRATCHPAD`… (env names as posted).
+- `--fit` under-accounting (#27595 open): assumes fixed 2 GiB compute buffer, misses KV/extra/ubatch → **set -c/-ngl/-ub explicitly**.
+- MTMD/vision crash on B70 Windows (#29241) — text-only advice stands.
+- Other open Intel leads: bad output qwen3next/Qwen3.6 (#28728), MoE Q8_0 silently falls to dequant_4x path (#27517), dual-GPU stuck load (#27547), MTP Q3 perf issues (#27373), 7900XT-comparison "MoE crushes XTX even at half VRAM" (#27376), `-sm tensor` 3x slower than single (#26409, hang risk w/ Q8 KV), Radix-topk #28670 merged (dflash family), XMX fast-gelu GELU Decoder PR (#29607 open, +10–20% potential).
+- Perf-improvement FRs: #28990 (root post) → anantshri/anirrudh branches: prefill 2–4x (#28918), TG improve (#28931) — third-party patch queue, worth cherry-picking tests.
+- ngram-mod on SYCL: #28860 (`--spec-ngram-mod` triggers huge scratchpad alloc ~2GB; open) → **prefer draft-mtp path over ngram-mod on SYCL until fixed**.
+
+### Backend recommendation (to A/B verify on rig)
+1. **SYCL (-sm layer)** — primary for long context & stability path; QSA sparse-FA works; watch RAM creep, long-ctx #28721 shows still-degradation but ~2-3x better than Vulkan at 15k–64k.
+2. **Vulkan (master ≥ b11261)** — fine short/mid ctx after #29476 GDN fix (huge on this arch; our rig runs GDN-heavy arch!); deep-ctx FA remains its weak spot until #29357 lands; MoE batch ≤8 rows.
+3. Text-only until vision issues fixed; separate-process mtmd (CPU/iGPU) if images needed.
+
+## 4. MTP / speculative decoding status
+
+- Unsloth MTP README (HF): stock llama.cpp **cannot** use `MTP/*.gguf` (no qwen4exp MTP graph, no shared-tensor borrowing). Options: unsloth prebuilt (tag `b10715-mix-86bd2d3`+, assets `app-<tag>-<os>-<arch>-{cuda,rocm,vulkan}.tar.gz` — **no SYCL asset, no fixed-up-to-#29476 vulkan yet**), fork PR #144, or **PR #28243 build** (`git fetch https://github.com/ggml-org/llama.cpp refs/pull/28243/head:pr-28243 && git switch…`).
+- Measured (B200): UD-Q4_K_XL 83.2→138.8 t/s (1.67x), IQ1_S 90.1→120.9; shared-Q8_0 accept 66%. **Concurrency 8 = net LOSS** (0.81–0.87x) → `-np 1`.
+- `--spec-draft-n-max 2` safe start (unsloth suggests up to 5 on big GPUs; reddit-adapted recipes use 2).
+- Reddit MTP thread (1w42biu): fprimex 18→38 t/s w/ unsloth build; **pmttyji after mainline #28123/#28023 merges: 108 no-draft → 183 t/s code / 144 prose** (pre-#28123: 83 = slower than no-draft!) → *build recency is the biggest MTP lever*. shared vs regular: shared = blk.48.* only (smaller; borrows embd/output from base model at runtime; needs fork).
+- `ngram-mod` (self-draft from model's own PLE/n-gram data): mainline & works today without fork; SYCL scratchpad bug #28860 (2GB+) may hurt; compose `--spec-type draft,ngram-mod`; ngram-map-k4v also exists. Forum wisdom: PLE stream versions still faster?? (no measured data vs MTP found; treat as fallback only.)
+- **Caution:** unsloth `b11160-mix-a6922cc` (2026-09-25, latest release w/ `linux-x64-vulkan.tar.gz`) predates #29476 GDN Intel fix (9-29) and post-9/25 qwen4exp fixes → **build #28243-on-master yourself for Intel**; the release binary only as smoke test.
+- unslothai/llama.cpp releases inventory (fetched): b11160-mix (cuda12/13, cpu, vulkan), b11120-mix-0.1.4, b10715-mix-86bd2d3 (early qwen4exp-mix, linux-x64/cuda13/rocm/vulkan, ubuntu20.04-sync, windows-x64); Volta.dll binaries injected per PR "for my GPU" (their fork).
+
+## 5. Strata (Niko1221/Strata) — analysis & transferable learnings
+
+Repo: C++ "strata" engine + Python server; 1,647★; runs Flash-Next 125B on 1× NVIDIA 12–24 GB + 64 GB RAM at 60–95 t/s (5070: Q2_0 93/74 @long; IQ3_S 53/46; prefill 1.6–2.2k t/s @32K) + MTP + adaptive GPU expert cache + SSD-streamed PLE.
+
+**Portability to this system: NOT usable.** GPU engine CUDA-only (+ experimental ROCm/HIP — reddit 1wsodqf confirms **HIP merged & user-verified: 7900XTX 55 t/s, 45 t/s @100K ctx, "x3 faster than llama.cpp"**). No Vulkan/SYCL/Intel path; author publicly seeking other-GPU hardware to port. CPU side = AVX2-capable (Arrow Lake OK — issue #142 was pack mismatch), but GPU kernels are custom CUDA/HIP. → *learnings only*, and hard proof the tiered algorithm ≈2–3x mainline llama.cpp offload on this model.
+
+Architecture (README + docs/DETAILS.md):
+1. Memory tiering: GPU = per-token-critical weights (attention/DeltaNet, gated residual, routers, **shared experts**, output head, MTP draft layer, KV) + **adaptive expert cache** (fit largest N; profile-rank 24,576 experts from `--dump-routing` warmup traces; adapts live). RAM = **all experts pinned**, CPU computes misses **concurrently** with GPU kernels (AVX-512/AVX2 ggml ops in-place, no FP16 expand). **SSD = 28.8 GB PLE table**, few rows/token via OS page cache.
+2. Speculation: MTP 3 tokens + **prompt-lookup up to 5** (code edits +6–11%); exact verify → no quality change.
+3. Prefill: chunks ≤8192; MMQ on quantized experts; **next-layer expert pre-stream over PCIe during current attention**; PLE per-chunk; tensor-guard + dual-channel helper threads copy unpinned experts (0.1.13 ~2x prompt speed).
+4. KV streaming ≥64K ctx: `--kv-resident 32768` keeps hot recent KV in VRAM, streams rest from RAM (~13.7 KB/token; Q2_0@262K: 50.9→62.6 t/s). Requires AvX512/VNNI CPU for best results.
+5. KV quant: int8 default ≥4K; q4_0 = −8–12% ppl (avoid); k8v4 rotated hybrid −23% needle-safe.
+6. Calibration: `--calibrate` → PCIe probe (measured 11.7 GB/s on x4-ish laptop → pcie_frac 0.25 vs default 0.55), pool workers; `STRATA_NO_SPIN=1` halves threads to avoid spinlocks pinning cores 100%.
+7. Two-shard pack (shard-1 GGUF = experts-RAM + resid-GPU tensors; shard-2 GGUF = PLE stream-only); mmproj separate process (`strata-vision`); low-RAM mode uses `experts.bin` mmap OS cache.
+8. Conversation cache: RAM checkpoints every 16K tokens (`--cache-stride`) → Claude Code/agent loops skip re-prefill (OpenClaw loop integration still an open issue #143).
+
+**Mapping to llama.cpp / this rig:**
+
+| Strata mechanism | llama.cpp equivalent for us |
+|---|---|
+| PLE on SSD, row-streamed | `--lazy-mode auto` (default) + fast NVMe + mmap load-mode (don't set `--load-mode dio/mlock` unless testing direct-read PRs #29030/#29599); unsloth files already split PLE into own shard (F16 quant PLE per QA notes) |
+| Adaptive GPU expert cache + CPU-par compute of misses | No adaptive cache in mainline → static layering: `-ot` ffn_exps regex patterns to CPU for overflow layers (keep hot early/mid layers' experts in VRAM first — router stats not available offline; heuristic: keep attn+shared experts GPU, spread routed experts; or use `-ncmoe N` simply); CPU-GPU overlap happens automatically in graph exec (async CPU nodes + subgraph streams) |
+| MTP + prompt-lookup (5) | PR #28243 build `-md mtp-…shared-Q8_0.gguf --spec-type draft-mtp --spec-draft-n-max 2..3`; mainline fallback `--spec-type draft,ngram-mod` (beware #28860 on SYCL) |
+| 8K-chunk prefill + expert pre-stream | `-ub 1024–2048` (ubatch; long-ctx keep ≤1024), `-b 2048+`; lazy-row prefetch PRs (#29599 PLE prefetch; #29030 direct reads) are the in-flight equivalents (not merged) |
+| KV streaming from RAM | **No equivalent** (KV VRAM-only; `-cram` = prompt-cache only; SR restore broken for hybrid #28194) → buy ctx headroom in VRAM instead; q8_0 KV halves need |
+| int8 KV | `-ctk q8_0 -ctv q8_0` (verify qwen4exp backend support; #29082 Vulkan SWA q-KV typo closed; SYCL hang w/Q8KV+tensor-split #26409 → single-dev OK) |
+| packing two shards | Not needed (unsloth split + lazy = same effect); `-m first-split-file` auto-discovers others |
+| per-PC calibration flags | `llama-bench` sweeps for `-ub`, `-ts`, KV, `-ot`; keep GPU0=PCIe5 `--main-gpu 0`; bias layer counts with `--tensor-split` (weights the *layer partition* per device) or `-ngl` math; P-core `-t` (Arrow Lake: P-cores only; Strata #142 lesson: E-cores slow expert math, keep them off GGML) |
+| conversation caching | `-cram 8192`+ & `-ctxcp` (accept hybrid caveat #28194: GDN state not resumed → re-prefill for slot-restore today; Strata-style harness-level loop cache (strata-cc-loop pattern) is the workaround anywhere) |
+| prose/code tuning | MTP n-max 2 prose / 3 code; `--spec-draft-p-min 0.10–0.5` tradeoffs |
+
+Strata-issue extra: GPU cap/distribution SciPy optimizer (multi-GPU PoC) for later porting; pack-split half duplication warned (`experts_empty` marker) — not relevant to gguf side.
+
+## 6. Community data points (Reddit r/LocalLLaMA — extracted via browser 2026-09-29)
+
+### 6.1 MTP release thread (1w42biu)
+- Run recipe unsloth release: `-m UD-Q4_K_XL…-00001-of-00004.gguf -md MTP/mtp-….gguf --mmproj mmproj-BF16.gguf --spec-type draft-mtp --spec-draft-n-max 2` → ~18→38 t/s (fprimex, hw n/a).
+- shared-variants need fork (PRs #142/#144); mainline = inert.
+- After #28123+#28023 merged: no-draft 108 → **MTP 183 t/s code / 144 prose** (pmttyji |87); before #28123, MTP was *slower* (83<108) → recency is the lever.
+- SSD/PLE offload confirmed `--lazy-mode auto`; BF16 PLE w/ small rest = unsupported combo (bennmann).
+- MLX corroborates architecture-level MTP gain +40–50% on Mac (Durian881); n-gram from SSD there too.
+- vLLM dual-3060 12GB RAM-constrained still 32K-ctx-capable (Original-Mistake8624, pre-MTP).
+
+### 6.2 merged-support thread (1w03zdo)
+- 4×3090 Q4_K_XL: **55 t/s** (jacek2023; `--parallel 1 -c 10000…`) — StyMaar flags it slow for 6B-active on that VRAM (correct: pre-MTP early qwen4exp, expert/main balance untuned).
+- 3×3090 + DDR4 experts Q6_K_XL: pp 81.7 / tg 16.8; **ik_llama.cpp fork: pp 146 (+80%)** / tg 15.8 (fizzy1242).
+- Dual 7900XT+128GB IQ4_XS **Vulkan**: pp ~110 / tg ~15 (mumblerit, unoptimized).
+- 16GB 6900XT + 32GB RAM + NVMe, IQ4 + `--fit fit-target/fit-ctx`: ~6.7 t/s @4k (Pasta-love) — naive fit is poor; explicit placement wins.
+- Compute-buffer trap: `-b/-ub 2048` OOM at 102K (whiteh4cker); **keep ub ≤512–1024 at long ctx** (artyomsv rule).
+- Flag lineage: `--tensor-read-lazy on/off/auto` (old) → **`--lazy-mode/-lzm`** (current, arg.cpp-verified, env LLAMA_ARG_LAZY_MODE). Fork-only `on-direct` variant (direct-I/O gather) = doubled prefill for 5090+CPU-experts user (rerri) — corresponds to unmerged mainline #29030/#29599 direction (strix-family branch ~pwilkin).
+- Vibe: "MTP and ngram offloading do not work" was true @merge-day; now: fork = yes, mainline = ngram-mod/partial.
+
+### 6.3 Strata threads (1wp7zyb validation thread, 1wsodqf affinity thread, author posts)
+- KnownAd4832 (README-aligned): 12GB 5070 + R5 7600 + 64GB DDR5 → **65.1 t/s tg @128K (Q2_0-GSQ/RCO), 44.8 (IQ3_XXS)**; pp 414–543 t/s; RAM+VRAM mins 37.6/39.2/47 GB; full 265K ctx needs ~64 GB combined; weights RAM-pinned, **only PLE streamed**; Coder variant: 44 tps/1300 pp on 32GB-RAM box; 90 tok/s Q2 reading in README table cited by Ok-Addendum3545 w/ 3090 24G "coding >100/chat >60" (Swift fork).
+- Skepticism logged: 5070-SFF numbers need logit-identity check (nasone32 |100); KV-flush-per-prompt criticism (Danmoreng); IQ3_XXS≈unsloth-Q5 equivalence challenged (lllll03l |45).
+- **psaun (|9): ran Flash-Next Strata-style with plain GGML-on-CPU (experts CPU, attn GPU) — 41.7 t/s tg, ≈2 t/s faster than Strata** → algorithm (not hardware) is the win; conceptually portable anywhere; llama.cpp stock approx = `-ot` CPU-experts + full-GPU attention (minus adaptive caching, minus KV-streaming).
+- **HIP merged & user-verified** (soyalemujica, 1wsodqf): 7900XTX+64GB: **55 t/s short, 45 t/s @100K** vs 15–25 t/s llama.cpp Vulkan/GSQ-RCO same-class → tiered exec ≈2–3x llama.cpp-offload; **no Intel path though** (author asking GPUs to port).
+- Cross-stack refs: high-end 128GB P2P rigs needed serious qwen4 kernels to reach 90 t/s/1600 pp — "optimizations not there yet for either vLLM or llama.cpp" (r1nzl3r99 |4); 24GB+64GB llama.cpp = "single digits to low teens" (DimeRhyme, who notes ROCm load-bug on AMD → use Vulkan there — parochial intel-vendor counterpart: our A/B mandate); DeProgrammer99 tried "a dozen commands": best `-ub 2048`, MTP didn't munch shared OR single-file heads on early fork (consistent w/ §2); 27B >> Flash-Next raw-speed feel on offload rigs.
+- Extras: Q2_0+GSQ/RCO "with ngram table on disk will work… prefill 400–500 t/s w/DDR5 without ngram RAM residency" (EvolvingDior, subjective quality-opinion reversed vs KLD — log only); agent-harness-driven config search (Accomplished-Air439: cloud-model-tuned offload = pp 100→400 t/s on 3×5060Ti+64GB) — adopt method!; 4× 3060 OCuLink/USB4 Strata mod 30+ t/s @64K (Content-Customer) shows eGPU-class placements viable; RTX5090+64GB community Strata edit → 130 t/s/700K ctx Q3 (+vision) (BringTea_666, unverified); halo-box/strix-llama.cpp & MoE4All (crashy) mentioned as fork family; "Don't hold your breath" for strix-optimizations reaching mainline (fallingdowndizzyvr).
+- ilintar Strix-Halo open branch (1weobt6): **pp 1358 t/s @131K** via custom HIP runtime atop mainline branch; targets mainline PR-ification ("will also help GLM 5.3 Flash, similar sparse attention") → QSA prefill gains may land upstream later; tg still behind closed halogen (29 vs 41); audioen parallel/ctx settings (`PARALLEL=2 B=2048 UB=2048 CTX=524288 ~900 t/s pp`); StephenBearman 7900XTX "Unleashed" build of this family: 47 t/s Q6_XLS 131k, authored `-lzm` mainline PRs, used `-sm none` trick to speed tg tail, FLOAT16-MTP-head trouble → use Q8/Q4 heads (fmirrors §1 note).
+
+### 6.4 B70-specific performance threads
+- 1tuik6o "llama.cpp benchmarks posted": (a) SYCL **dense** 27B Qwen3.6 UD-Q5_K_XL → ~**63 t/s tg** (cross-post title; comments: only ~150 GB/s effective BW used of 608 → sw-immature, headroom); (b) **MoE** A3B Q4_K-M table (above, 977 pp/70.5 tg); (c) Vulkan/Windows A3B-MTP: cliff at depth (CoolConfusion); (d) wayofTzu Q5 27B/A3B deeper tables (linked /r/LocalLLM/1tuf6l1); (e) ecosystem takes: "software stack totally pants & extremely unreliable with smallest change" but "much more affordable than 5090; VRAM first, speed second" + Strix-Halo-even (fallingdowndizzyvr) + 3090-price-for-1/3-perf banter + cluster-viability angle (jacek2023 buying 4× B70s instead of 4th 3090) + vLLM-better claim (ImportancePitiful795): "use vLLM Intel LLM Scaler for benchmarks across stacks" — video link: MnGLqo5cuGQ.
+- vLLM-XPU deep dive (1vulh45, B70 32GB, Ubuntu 26.04 kernel 7.0, 256 EU): Qwen3.8-**27B** GPTQ-INT4 → **52.2 t/s median decode w/ MTP2 spec-dec, FP8 KV, prefix caching, 64K prod/128K opt ctx, tools+agent passing**; "on this hybrid (mamba) model vLLM beats llama.cpp SYCL by ~1.8x" (their words); stack: OMIX 0.3.0, DPC++ 2026.1, LZ 1.28.6, compute-runtime 26.22, vLLM 0.27.1-XPU docker; **MTP2 was the sweet spot** (MTP1 47.1 → MTP2 52.2 → MTP3 51.6/MTP4 51.9), baseline gain mostly new XPU graph runtime (18.7→33.3 w/o MTP); long-agent ctx ~150K: 37→46.5 t/s w/ newer INT4-draft/MTP4+INT8-target-head runtime hacks; 223K ctx window; concurrency crashes with MTP (max-num-seqs 1!) unless scheduler-patched; two subagents on single B70 = 1.46x wall-time win with segregation patch. **Note: this is Qwen3.8-27B (dense-hybrid mamba), not Flash-Next MoE** — vLLM XPU has no qwen4exp GGUF/PLE story; but the MTP2 insight + graph-mode win transfer conceptually (our §2 says llama.cpp Vulkan GDN fix ≈ analogous leap; we'll test both).
+  - In-thread llama.cpp SYCL reality check (chumbleyjl): Qwen3.8-27B Q4_K_XL, Fedora, SYCL full-offload, 262K ctx, q8 KV, FA on, b4096/ub2048, MTP-ish spec shallow, d/kv bf16 → **pp ~534 t/s, tg ~23 t/s** single-stream agent use ("usable"); 5060Ti-class nvfp4 27B llama.cpp: ~50 t/s low-ctx (Forsaken_Object7264 cross-ref).
+  - Fan-control side note: stock xe exposes rpm but not writable pwm curves on Battlemage; exzile/intel-arc-pro-fan-control kernel-patch project exists (B60/B70, manual curves + GUI service) — worth for multi-GPU thermal headroom under sustained load.
+  - CySpiegel/vllm-intel: community B70 vLLM XPU build stable in high-concurrency, one-liner docker (`cyspiegel/vllm-xpu-b70:latest`, model CySpiegel/Qwen3.8-27B-Int4-AutoRound).
+
+### 6.5 "Best model for Arc Pro B70" (1sjlowl) — fit philosophy
+- semangeIof: B70 memory-BW means **dense = slow; prefer MoE-A4B class** per card; Q6 of 26B-A4B fits w/ good ctx if cmdline right; dense Q4 fits w/ very high ctx if you accept slow tg. "B70 is very much a **tinkerers card**; you'll probably end up on vLLM; software support less mature; bugs & inconsistency, but great power efficiency + cheap VRAM."
+- ea_man model-sizing heuristic: size(model)+VRAM(ctx) ≤ VRAM, then Qwen3.8/Gemma classes; remember **B70 ≈ "average RAM speed, bad SW optimization → 2× VRAM for ½ the speed"** rule of thumb.
+
+### 6.6 7900XTX 24GB+64GB "can I run it" (1wsodqf) — RAM-limited analog of our rig
+(Consolidated into §6.3/§6.4 above; bottom line: llama.cpp-naked = poor; Strata-tier execution = the differentiator; ngram must be disk-streamed; experts mostly RAM; single digits → 55 t/s spread depending on engine maturity.)
+
+### 6.7 64GB vs 192GB RAM on large MoE (1w4xr6q) — PARTIAL (page bot-walled on re-open; content captured from first load)
+- Author-of-Strata performance claims in-thread (KnownAd4832): Q2_0-GSQ/RCO **1456 pp / 54.5 tg**, IQ2_XS 1300/50, IQ3_XXS 1100/47 at 16K ctx class (claimed rig: 5070Ti + 96 GB DDR5-9600-ish) — vs community llama.cpp q2-k configs "only ~500 pp / 17 tg" (Old_Quality5780). Treat both as unverified community numbers; direction consistent with §6.3.
+- Weird_Editor2105: "llama.cpp alright, fits 128GB VRAM, full precision runs Qwen3-1M... 13k pp 116 t/s" (class-flex, not applicable); AtomicSheep9083: **ik_llama dual-B580 Q4_23B + lazy PLE + `-ot non-V`: 660 pp / 20 tg trig**, system ~80% Q6_K_XL — second cross-check that PLE-lazy + partial CPU placement is *the* pattern on small-VRAM Intel too.
+- StephenBearman (lazy-mode PR author) confirms on the halo fork: lazy-mode PRs → large pp gains (multi-x on his 7900XTX), `-sm none` tail-latency trick, MTP heads better at Q8/Q4 than FLOAT16.
+
+### 6.4a vLLM-XPU B70 deep dive (1vulh45, dense 27B, for stack context)
+- See above (§6.4); extra internals worth borrowing conceptually: new XPU graph runtime = biggest single jump (18.7→33.3 t/s no spec); **MTP2 = sweet spot of the ladder** (47.1/52.2/51.6/51.9); FP8-KV + prefix cache baseline; MTP+concurrency unstable (crash) without scheduler-segregation patch; 223K ctx class achievable on one card for the *dense* model (Fooled_Object7264: 2x16GB NVIDIA nvfp4 27B ≈ same 50 t/s class). None of this runs Flash-Next-GGUF (no qwen4exp in vLLM XPU; no PLE/MTP-GGUF story) → stays a *serving-alternative* datum only if user ever abandons GGUF requirement (safetensors FP8/W8A8 would fit 2×32 GB: 125B is ~66 GB FP8 — plausible later; watch vllm xpu qwen4exp support PRs: none found today).
+
+### 6.8 Misc
+- Qwengram-0.8B (1wpvep4): PLE transplanted into Qwen3.5-0.8B → −5% val ppl (isolates PLE value; curiosity).
+- "Qwen will be the king?" (1w53ti8) / "$3k 128GB VRAM + 256GB DDR4 server" (1wfe9zt): budget-rig chatter, no B70 data — skipped.
+- DGX Spark NVFP4 single-box Flash-Next 262K (1wjzg4c) — reference-class, not applicable.
+- B60/B65 worth-it for 3.8-27B (1w0szzv), Panther-Lake iGPU B390 (1sj30an) — peripheral hints: smaller Intel cards same architecture family, relevant if user considers iGPU offload target for mtmd-cli.
+
+## 7. Open questions / to verify (post-Reddit-pass) — research-phase answers ✅ where closed
+
+1. ✅ `-sm tensor`/qwen4exp: disabled mainline (#27941; re-enable #28569 open, RPC-verified only). **Layer split is the mode**; #29562 (CUDA 7-GPU, 65K-prompt deterministic prefill assert in qwen4exp graph) flags a deep-prefill risk class — test long prompts early on our rig, FA on/off, single vs split.
+2. ⏳ On-hardware only: SYCL-vs-Vulkan qwen4exp head-to-head (no public B70 numbers post-#29476) → bench ladder §6.8.
+3. ⏳ On-hardware only: MTP-on-SYCL build (#28243 + `-DGGML_SYCL=ON`); cautions: #27373 (SYCL+MTP old-arch), #28778 (dual-B70 TDR with DFlash2 speculative draft) → single-GPU MTP test before enabling split.
+4. ✅ Partially — platform edge cases exist around lazy mmap (Metal span bug #29465 closed-as-Metal-specific; direct-read gather PRs open #29030/#29599 w/ >2x prefill prototype #28136). On-rig: measure PLE row-fetch cost second-run (page-cache warm) via iostat + repeated prompts; NVMe 4K-random spec sheet check.
+5. ✅ Don't use `--fit` for final sizing (#27595 open: assumes 2 GiB compute), set `-c/-ngl/-ub/-ot` explicitly; `-ngl` honored for qwen4exp (per #26221 remark pattern) — verify in first boot log.
+6. ✅ Text-only on Intel (vision broken both backends; #29093 body fetched — CPU-only inference works correctly, so side-process vision on CPU/iGPU is the escape hatch).
+7. ⏳ User/rig: CPU SKU (P-core count), both GPUs' lspci lane widths, OS choice — **ask user**; defaults assumed Linux.
+8. ✅ OS lean: **Linux** (all deep dual-B70 bug ecosystems are xe/LevelZero-based; Windows adds #26547 idle-eviction class + WDDM reset fatigue). Keep Windows-Vulkan as compat fallback only.
+9. ✅ Build recency: master ≥ b11261 mandatory (GDN fix #29476 merged 2026-09-29 — pre-built unsloth Vulkan b11160 predates it by 4 days → smoke-test only); watch for next unslothai release post-#29476 (b1126x-mix) before considering prebuilts again.
+10. ✅ ik_llama.cpp has qwen4exp in master (verified live 2026-09-29) — documented as fallback alt-runtime (§6.7/§7a).
+
+## 7a. Unread/skipped thread index (low expected value; revisit if user asks)
+1w0szzv (B60/B65 vs 3.8-27B), 1sj30an (Panther Lake B390 iGPU), 1wpprlr (HBM-is-loose op-ed), 1wjzg4c (DGX Spark NVFP4 262K Flash-Next reference), 1wsekkj (27B-vs-Flash-Next model-choice), 1vy1g90 (B60 dual-48GB sighting), 1wnzlav (meme), 1wg7dd5/1wj3s31 (Swift-27B hype), 1wfe9zt ($3k DDR4 server), 1w53ti8 (Qwen-will-be-king chat), 1tlqr8zx (PFlash RTX3090 128K — separate closed engine family), 1rmvf84 (Qwen3.5-35B slowness lore), 1qwbmct (Coder-Next 5060Ti), 1wpvep4 (Qwengram-0.8B curiosity), 1w80ho8o (review thread), 1wfe9zt, 1scs0tp/1ndwos5 (Strata mentions, irrelevant).
+
+## 8. Draft recommendation (to be A/B-verified on hardware; finalize at end)
+
+**Two-track test harness.**
+- Track A (**long-context priority**): **SYCL** oneAPI nightly (compute-runtime ≥ 26.31/IPSC 0.1 per #27198 fixes; DPC++ 2026.1 ref), master build (`-DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx …` per Intel XPU quick-start docs), `-sm layer`, FA default-on (QSA sparse-FA merged #28796 — the deep-ctx saver), env fallbacks ready: `GGML_SYCL_DEV2DEV_MEMCPY=2` or `GGML_SYCL_ENABLE_VMM=0` (+ `UR_LOADER_USE_LEVEL_ZERO_V2=0` if launch-SEGV); never `-sm tensor` (leak #27845, crash #27198, disabled anyway #27941); monitor RSS creep; single-GPU `--fit off` explicit sizing (#27595).
+- Track B (**short-ctx baseline / compat hammer**): **Vulkan master ≥ b11261** (must include GDN tuning #29476; fused-hc #29520), `-fa on`, `-ub 512–1024` (batch ≤8 rows awareness #25356 if multi-request), expect pp strong / tg fine ≤16K, degrade at depth until #29357 Intel-FA-prefill & scalar→matrix decode-FA land; Windows caveats #25646/#29654.
+- Both: single-slot first (`-np 1`, `-kvu`), MTP later (§6.1 speed layer), text-only (no mmproj) until #29093/#29241 fixed.
+
+**Quantization:** default **UD-Q4_K_XL** (111.3 GB; 92.3% top-1) — feasible because PLE (~29–36 GB of that) stays lazy/streamed and MoE experts partially offload; fallback **UD-IQ4_XS** (93.7 GB, 89.6%) or **UD-Q3_K_XL** (90 GB, 88.3%) for +17–21 GB VRAM/RAM working headroom (KV+compute buffers); ≤2-bit rejected per quality goal (82.7% top-1 cliff + KLD 0.225). MTP head: `shared-Q8_0` (2.6 GB, needs fork-build; unsloth "BF16 head = bigger AND slower"). mmproj only when vision matters (and via side process).
+
+**Placement/layout:** `--split-mode layer`, `--main-gpu 0` (PCIe5 card = GPU0). Start even (48 layers ~24/24); because GPU1 rides PCIe4/via-PCH (likely x4 ≈ 8 GB/s — verify `lspci -vv`), bias *residency* not *traffic*: layer split only moves small activations across links per layer (~KB/token for hidden 2560 — fine even at x4), so the real cost of imbalance is expert/weight residency → tune `--tensor-split ~1.15,1` and/or `-ot` overrides until VRAM on GPU1 is ~utilized; simplest robust split: **GPU0 (PCIe5) = first ~26 layers, GPU1 = rest**, overflow the last layers' routed experts to CPU via `-ot 'blk\.(\d+)\.ffn_(gate|up|down)_exps.*=CPU'`-style overrides only if VRAM says so (keep attn_v/attn_k, ssm, shared-expert & router tensors GPU-resident — per §5 mapping; `-cmoe` is too blunt for this rig). CPU overflow executes auto-interleaved with GPU graph (psaun-style overlap comes free). KV: `-ctk q8_0 -ctv q8_0`, `-c` ladder 32K→64K→128K (QSA KV per token ≈ 24.6 KB f16 / 12.3 KB q8_0 → 128K ≈ 1.6 GB q8_0 + GDN fixed state; budget trivial vs weights — ctx is NOT the constraint, VRAM residency is), `-fa on`, **`-b 2048 -ub 512` default** (long-ctx compute-buffer OOM trap §6.2 → only benchmark `-ub 1024/2048` at short ctx), `-t <P-core count>` (Arrow/Lunar Lake: P-cores only for GGML math; E-cores → OS/prefetch; Strata #142 lesson), NVMe page-cache warm second-prompt behavior expected (test `-lzm on` vs `auto` A/B; PLE F16 36 GB / 4-bit ~29 GB shard must never bloat resident set — check first-boot log "money tensors"; mmap default, no mlock (RAM is expert-overflow budget), no `--load-mode dio` (kills lazy page-cache reuse w/o the unmerged direct-read PRs)). Agent prompt cache: `-cram 8192..16384` + `-ctxcp` (caveat: hybrid/GDN state NOT resumed on slot-restore today #28194 → re-prefill tax; harness-level cc-loop-style caching à la Strata as stopgap). No `--fit` (sizing explicit; #27595).
+
+**Speed layer (after stable track winner):** PR #28243 local build for chosen backend (`git fetch https://github.com/ggml-org/llama.cpp refs/pull/28243/head:qwen4exp-mtp`), `-md MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf --spec-type draft-mtp --spec-draft-n-max 2` (try 3 for code), `-np 1` only (concurrency loss documented), defaults for impl/'-p-min'; fallback no-fork: `--spec-type draft,ngram-mod` (skip on SYCL until #28860 resolved; Vulkan test ok). Do NOT ship the prebuilt b11160-mix Vulkan binary as final tool (predates Intel GDN fix; expect ~5–10x slower GDN layers than current master on our arch) — smoke test only.
+
+**Verification ladder:** (1) llama-bench A/B: `-ub {512,1024,2048}` × {pp512,tg128} short ctx, single-GPU vs layer-split each backend; (2) integrity: greedy 500-tok @8K/32K vs CPU reference (hybrid-state bug class #28728/#29002/#29092); (3) MTP A/B (accept-rate ≥66% target, net tg gain, zero corruption); (4) 30-min soak: RSS/VRAM (leak classes #27845/#25646, esp. Windows); (5) agent-loop reality check (`-cram/-ctxcp`, expect re-prefill tax; consider harness-side cache); (6) vision-needs decision → side-process mtmd until fixed trackers close; (7) if performance target band missed (below sanity targets), escalate: anantshri SYCL branch trial (#28918/#28931) → ik_llama.cpp qwen4exp check → psaun-style CPU-GGML tiered experiment (his reported 41.7 t/s on experts-CPU/attn-GPU with ark ggml tricks) → worst-case wait-triage on #29245/#28569 merges.
+
+**Sanity targets (calibrate expectations from §3/§6 anchors):** qwen4exp on our rig, correct layout: tg short-ctx Q4_K_XL ≈ **35–65 t/s** (anchors: B70-A3B ~70; psaun-tiered ~42–56; 4×3090 pre-fix mainline 55; GDN fix + MTP headroom to exceed 65 at -sm layer with most experts VRAM-resident), pp (ub 512–2048) ≈ **600–1400+ t/s** short-ctx (B70 A3B 977 anchor; ilintar/strix 1.2–1.4k at depth w/ custom kernels; our SYCL-Vulkan mainline likely 600–1100 pre-MTP-era fixes, more after); @32K tg degradation ≤1.5x, @128K ≤3x on SYCL (Vulkan worse until FA landings). If landed ≪band (e.g. <20 t/s), config wrong (PLE resident, fit-mode undersizing, tensor-split attempted) — re-check placement logs first before blaming stack.
+
+## 9. Source index (fetched live this session, 2026-09-29)
+
+HF: repo API/tree/readme (`unsloth/Qwen3.8-Flash-Next-GGUF`), `MTP/README.md`, GGUF header parse of `UD-Q4_K_XL/…-00001-of-00004.gguf` (first 4 MB; §1).
+GitHub llama.cpp (bodies/comments): #27742, #27836, #28243, #28721, #26581, #27198, #27845, #28860, #29093, #29241, #28728, #28100, #29562, #28569, #25612, #29476, #29520, #28796, #29132, #29245, #29186, #29608, #29030, #29599, #28136, #28953, #29459, #27595, #28194, #28092, #25356, #28123, #28023, #28901, #28670, #28990, #28918, #28931, #28778, #26610, #27373, #27517, #27547, #26409, #29654, #29607, #29639, #29357, #24406, #24408, #29465, #26221, #27941, #27880.
+Strata: repo API, README, docs/DETAILS.Rmd, docs/MULTI_GPU.md, issues #142/#143/#119/#98/#92/#88, releases 0.1.13–0.1.17.
+unslothai/llama.cpp: releases API (b10715-mix / b11120-mix / b11160-mix; assets incl. linux+windows vulkan), PRs #142/#144 (via MTP README).
+ik_llama.cpp master: verified live (6 qwen4exp refs in src/llama-model.cpp, pushed 2026-09-29).
+Reddit r/LocalLLaMA (browser-extracted): 1w42biu (MTP release), 1w03zdo (merged support), 1wp7zyb (Strata 12GB validation), 1wsodqf (7900XTX + Strata HIP), 1weobt6 (Strix Halo 1.2k pp / ilintar), 1tuik6o (B70 llama.cpp benchmarks), 1vulh45 (B70 vLLM XPU 27B), 1sjlowl (best model for B70), 1w4xr6q (64 vs 192 GB RAM MoE, partial — bot-walled on re-open).
+
+## 10. Candidate llama.cpp tweaks for this rig (derived from §2–§8)
+
+### A. Free wins — cherry-pick open PRs onto master (no new code)
+1. **#29030 + #29599 (lazy-PLE direct-read gather + `llama_prefetch_rows`/`--prefetch-rows`)** — highest value here: the 29–36 GB PLE stream is the bottleneck; replaces per-row `madvise(DONTNEED)`+refault with batched single-syscall gathers + prefetch during compute. Prototype #28136 showed **>2× prefill** on a similar rig (closed unmerged but rebases).
+2. **#28243 (Qwen3.8 MTP)** — main speed lever (community: 108→183 t/s class after #28123 landed); build locally for SYCL/Vulkan until merged.
+3. **anantshri SYCL branches: #28918 (prefill 2–4×), #28931 (TG)** — third-party patch queue; A/B vs master SYCL.
+4. **Env-only:** `GGML_SYCL_ENABLE_VMM=0` or `GGML_SYCL_DEV2DEV_MEMCPY=2` if any dual-device P2P path is used (#27198 RCA); oneAPI nightly compute-runtime ≥26.31; `-lzm on` explicit; never `--load-mode dio/mlock` until (A-1) lands.
+
+### B. Worth writing / upstreaming — targeted code changes
+1. **Vulkan decode-FA for Xe2** (fixes the ~8× deep-context collapse, #28721): decode runs the scalar `sd` path when `n_rows==1` — matrix cores never engage. Port a red-atomic multi-head FA dispatch (AMD `ON_Ac`-style used for `n_rows>1`) to Battlemage for the 24 Q-heads; #29357 (open) only addresses prefill. Biggest single Vulkan-side win.
+2. **#25356 MUL_MAT_ID batch cliff**: MMV-kernel cutoff at `n_tokens>8` is uncalibrated for Intel (measured on gfx1151); make the threshold backend-queryable (Xe2 XMX/EU-group widths differ) in the Vulkan/SYCL `mul_mat_id` dispatch. Cheap; protects MTP verify batches and `-np>1`.
+3. **SYCL VMM peer-mapping (#27198/#29459)**: per-device-context pools lacking peer mappings break ggml's `dev2dev_memcpy`; peer-map at pool creation or route to device-native allreduce buffers. Unblocks `-sm tensor` (which #28569 wants to re-enable for qwen4exp) — but low ROI *on this box* (GPU#1 behind PCH PCIe4; layer split already sufficient). Upstream hygiene, do last.
+4. **PLE hot-row cache** (Strata engram insight, absent in mainline): small LFU row cache layered over lazy reads — agent loops re-hit identical trigram rows; implementable entirely in the mmap/model-loader path, no ggml changes; complements A-1's gather API.
+5. **Router-aware `-ot` generator** (offline tool, zero core risk): dump routing traces (`--dump-routing`-style like Strata's profiler), rank expert hotness, emit the pattern set pinning hot experts to VRAM / cold ones to CPU (`blk.N.ffn_(gate|up|down)_exps…=CPU`). Static-but-calibrated approximation of Strata's adaptive expert cache — most of its benefit, none of its runtime complexity.
+6. **KV overflow-to-RAM** (Strata `--kv-resident` : deep-ctx KV streaming): no mainline equivalent; deprioritized — q8_0 QSA KV ≈1.6 GB @128K, so VRAM starvation unlikely at our context targets; revisit only if the 128K ladder fails.
+7. **#29562 deep-prefill assert class**: instrument `llama-graph.cpp` QK≤128 / >128 `OP_NOTE` threshold + layer-split mask handling (CUDA repro at fixed offsets on 65K prompts; graphs are backend-shared) — stabilize before long agentic prefills on split.
+
+### C. Deliberate non-goals
+- `-sm tensor` on this rig (PCH-PCIe4 GPU#1 + leak #27845 → layer split is correct).
+- `--fit` reliance (#27595 accounting), BF16 MTP head (bigger *and* slower), `ngram-mod` speculation on SYCL (#28860 scratchpad), vision/mmproj on Intel until #29093/#29241 close (out-of-process mtmd on CPU/iGPU instead), any prebuilt unsloth binary older than the #29476 GDN fix (≈10× penalty across 36/48 layers).
+
+Suggested sequencing if implementing: A-1+A-2+A-4 (config/patch day) → B-5 tool (profile run) → bench ladder §8 → B-1/B-2 kernel work only if targets missed → B-4 → B-3/B-6/B-7 upstream backlog.
+
+## 11. User stories for upstream engagement (§10 packaged)
+
+One file per initiative, in this workspace:
+
+| File | Scope (from §10) | Upstream anchor | Our posture |
+|---|---|---|---|
+| `us_29030.md` | A-1 lazy-PLE direct-read gather + prefetch | #29030/#29599/#28136 | rebase + bench, consolidate direction |
+| `us_28243.md` | A-2 qwen4exp MTP (shared-head borrowing) | #28243 ← #27836/#28097 | unblock/land, rig data |
+| `us_29245.md` | SYCL grouped-MoE XMX GEMM | #29245 | accelerate, provide B70 numbers |
+| `us_28721.md` | B-1 Vulkan decode-FA on Xe2 (deep-ctx collapse fix) | #28721 (+#29357 pair, #26581 ceiling) | write kernel/dispatch patch |
+| `us_25356.md` | B-2 MUL_MAT_ID n>8 cliff → backend-queried cutoff | #25356 | measure Intel threshold shape, carry small patch |
+| `us_27198.md` | B-3 SYCL VMM peer-mapping (dual-device P2P) | #27198/#29459/#28569 + intel/compute-runtime #995/#996 | watch, provide same-GPU-model repro data |
+| `us_plecache.md` | B-4 PLE hot-row LFU cache | rides #29030 | propose design → small PR |
+| `us_otgen.md` | B-5 router-aware `-ot` generator | new trace-hook request; consumes `-ot` | out-of-tree tool + one feature request |
+| `us_kvram.md` | B-6 KV overflow-to-RAM | Strata `--kv-resident` analog | parked; trigger-based re-evaluation |
+| `us_29562.md` | B-7 deep-prefill assert (qwen4exp graph, layer split) | #29562 | repro-or-negative data, patch turnaround |
+
+Each story: persona, user-story form, evidence-cited rationale, acceptance criteria, definition-of-done. Shared constraint (user policy): contact/engage existing PR/issue owners first, no silent forks; §10.C non-goals apply repo-wide.
