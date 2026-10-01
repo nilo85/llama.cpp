@@ -1623,6 +1623,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             throw std::runtime_error("model has expert layers but no expert layers are used");
         }
 
+        if (const char * env_split = getenv("LLAMA_EXPERT_SPLIT")) {
+            const int n_expert_parts = atoi(env_split);
+            if (n_expert_parts > 1) {
+                ml.reserve_part_tensors(static_cast<int>(hparams.n_layer_all)*3*n_expert_parts);
+            }
+        }
+
         layers.resize(n_layer_all);
 
         // call the per-model loading function
@@ -3319,6 +3326,46 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);
     return create_tensor(*ml, tn, ne, flags);
+}
+
+ggml_tensor * llama_model_base::create_expert_part(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
+        const std::string & part_name, size_t part_offs, ggml_backend_buffer_type_t buft) {
+    GGML_ASSERT(ml != nullptr);
+    ml->part_spec.name = part_name;
+    ml->part_spec.offs = part_offs;
+    ml->part_spec.buft = buft;
+    ml->part_spec.active = true;
+    return create_tensor(*ml, tn, ne, flags);
+}
+
+ggml_backend_buffer_type_t llama_model_base::get_expert_split_buft(int il, int part_idx) const {
+    ggml_backend_dev_t cur_dev = pimpl->dev_layer[il].dev;
+    const buft_list_t * cur_buft_list = pimpl->dev_layer[il].buft_list;
+
+    if (ggml_backend_dev_type(cur_dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        GGML_ASSERT(cpu_dev != nullptr);
+        return ggml_backend_dev_buffer_type(cpu_dev);
+    }
+
+    if (part_idx == 0) {
+        return (*cur_buft_list)[0].second;
+    }
+
+    int seen = 0;
+    for (const auto & kv : pimpl->gpu_buft_list) {
+        if (kv.first == cur_dev) {
+            continue;
+        }
+        ++seen;
+        if (seen == part_idx) {
+            return kv.second[0].second;
+        }
+    }
+
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    GGML_ASSERT(cpu_dev != nullptr);
+    return ggml_backend_dev_buffer_type(cpu_dev);
 }
 
 void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {

@@ -346,6 +346,17 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_exps_s   = nullptr;
     struct ggml_tensor * ffn_up_exps_s     = nullptr;
 
+    // optional expert partitioning: when non-empty, the MoE FFN is built as one masked subgraph per part
+    std::vector<struct ggml_tensor *> ffn_gate_up_exps_parts;
+    std::vector<struct ggml_tensor *> ffn_gate_exps_parts;
+    std::vector<struct ggml_tensor *> ffn_up_exps_parts;
+    std::vector<struct ggml_tensor *> ffn_down_exps_parts;
+    std::vector<struct ggml_tensor *> ffn_gate_up_exps_s_parts;
+    std::vector<struct ggml_tensor *> ffn_gate_exps_s_parts;
+    std::vector<struct ggml_tensor *> ffn_up_exps_s_parts;
+    std::vector<struct ggml_tensor *> ffn_down_exps_s_parts;
+    std::vector<int64_t> ffn_expert_part_offsets; // expert index of the first expert in each part
+
     // ff MoE latent proj
     struct ggml_tensor * ffn_latent_down = nullptr;
     struct ggml_tensor * ffn_latent_up   = nullptr;
@@ -821,6 +832,13 @@ struct llama_model_base : public llama_model {
 
     // convenience overload of create_tensor that doesn't require llama_model_loader
     ggml_tensor * create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    // create a synthetic byte-slice of an existing GGUF tensor, placed on a specific buffer type
+    ggml_tensor * create_expert_part(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
+            const std::string & part_name, size_t part_offs, ggml_backend_buffer_type_t buft);
+
+    // pick the buffer type for expert part `part_idx` of layer `il` (part 0 = layer device, part 1+ = another GPU or CPU)
+    ggml_backend_buffer_type_t get_expert_split_buft(int il, int part_idx) const;
 
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,

@@ -1128,7 +1128,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             int max_n_tensors = n_tensors;
             max_n_tensors += 1;                   // duplicated output tensor
             max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
-            if (files.empty()) {
+            max_n_tensors += n_part_tensors;
+            if (files.empty() || !part_spec.name.empty() || n_part_tensors > 0) {
                 max_n_tensors += hparams.n_layer()*256; // this should be well above what any model actually uses
             }
             const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
@@ -1288,6 +1289,65 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         return buft;
     };
+
+    if (part_spec.active) {
+        part_spec.active = false;
+
+        if (!files.empty()) {
+            ggml_type type = GGML_TYPE_F32;
+            const llama_tensor_weight * orig_w = get_weight(tn.str().c_str());
+            if (orig_w && orig_w->tensor) {
+                type = orig_w->tensor->type;
+            } else {
+                const int64_t tid = gguf_find_tensor(metadata, tn.str().c_str());
+                if (tid != -1) {
+                    type = gguf_get_tensor_type(metadata, tid);
+                }
+            }
+
+            ggml_tensor t_meta;
+            memset(&t_meta, 0, sizeof(ggml_tensor));
+            t_meta.type = type;
+            for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
+                t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
+                GGML_ASSERT(t_meta.ne[dim] >= 1);
+                if (dim == 0) {
+                    t_meta.nb[dim] = ggml_type_size(type);
+                } else if (dim == 1) {
+                    t_meta.nb[dim] = ggml_row_size(type, t_meta.ne[dim-1]);
+                } else {
+                    t_meta.nb[dim] = t_meta.nb[dim-1]*t_meta.ne[dim-1];
+                }
+                GGML_ASSERT(t_meta.nb[dim] >= 1);
+            }
+            ggml_set_name(&t_meta, part_spec.name.c_str());
+
+            ggml_backend_buffer_type_t buft = part_spec.buft;
+            if (!buft) {
+                buft = buft_for_tensor(&t_meta);
+            }
+            if (!buft) {
+                return nullptr;
+            }
+
+            ggml_context * ctx = ctx_for_buft(buft);
+            ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
+            ggml_set_name(ret, part_spec.name.c_str());
+
+            if (orig_w) {
+                llama_tensor_weight w(orig_w->idx, orig_w->offs + part_spec.offs, ret);
+                weights_map.emplace(part_spec.name, w);
+            }
+
+            size_data += ggml_nbytes(&t_meta);
+            n_part_tensors++;
+
+            LLAMA_LOG_DEBUG("expert part: %s type=%s buft=%s bytes=%zu offs=%zu\n",
+                    part_spec.name.c_str(), ggml_type_name(type), ggml_backend_buft_name(buft), ggml_nbytes(&t_meta), part_spec.offs);
+
+            return ret;
+        }
+    }
 
     if (files.empty()) {
         if (flags & TENSOR_SKIP_IF_VIRTUAL) {

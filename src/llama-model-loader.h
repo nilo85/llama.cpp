@@ -48,6 +48,9 @@ struct llama_model_loader {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
         }
+
+        // for synthetic tensors that are byte-slices of an existing GGUF tensor
+        llama_tensor_weight(uint16_t idx, size_t offs, ggml_tensor * tensor) : idx(idx), offs(offs), tensor(tensor) {}
     };
 
     // custom comparator to sort weights more nicely by layer
@@ -74,6 +77,7 @@ struct llama_model_loader {
     int n_kv      = 0;
     int n_tensors = 0;
     int n_created = 0;
+    int n_part_tensors = 0;
 
     uint64_t n_elements = 0;
     size_t   n_bytes    = 0;
@@ -126,6 +130,14 @@ struct llama_model_loader {
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
+
+    // when set, the next create_tensor() call creates a synthetic byte-slice of the named GGUF tensor
+    struct expert_part_spec {
+        std::string name;
+        size_t offs = 0;
+        ggml_backend_buffer_type_t buft = nullptr;
+        bool active = false;
+    } part_spec;
 
     gguf_context_ptr metadata_ptr;
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
@@ -237,6 +249,10 @@ struct llama_model_loader {
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    void reserve_part_tensors(int n) {
+        n_part_tensors += n;
+    }
 
     void done_getting_tensors(bool partial = false) const;
 
