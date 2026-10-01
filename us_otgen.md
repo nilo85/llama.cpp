@@ -83,7 +83,7 @@ Tool exists in this workspace with a `--help` matching the emitted-format spec, 
 - Cross-backend adds for the per-part outputs may add latency; the win depends on hot-expert residency.
 
 ## Work Log & Resume Context
-_State: PER-EXPERT M1 VALIDATION + SINGLE-GPU PARITY PASSED ON `us-otgen-expert-ot` 2026-10-01; loader, graph, and Qwen4exp wiring are in place. Q2_K_XL K=2 passes single-GPU `-ngl 2`, dual-GPU `-ngl 48`, and single-GPU greedy parity against the unsplit path. Next is push decision / dual-GPU parity or Q3 / routing-aware placement._
+_State: PER-EXPERT M1 VALIDATION + SINGLE-GPU PARITY PASSED ON `us-otgen-expert-ot` 2026-10-01; loader, graph, and Qwen4exp wiring are in place. Q2_K_XL K=2 passes single-GPU `-ngl 2`, dual-GPU `-ngl 48`, and single-GPU greedy parity against the unsplit path. Pushed to `nilo85` at `6a9e94689`. Next is dual-GPU parity/perf or Q3 / routing-aware placement._
 
 ### 2026-10-01 — Design + branch strategy (agreed with user)
 - **Goal:** replace static layer-uniform `-ot` placement with workload-calibrated expert placement. Trace per-layer MoE routing over a representative pass, rank expert hotness, solve a VRAM-budget knapsack split proportional to per-device bandwidth, emit an `-ot` pattern file.
@@ -194,4 +194,5 @@ _State: PER-EXPERT M1 VALIDATION + SINGLE-GPU PARITY PASSED ON `us-otgen-expert-
 - Both runs produced the same 32-token output: `A GPU (Graphics Processing Unit) is a specialized electronic circuit designed to rapidly manipulate and alter memory to accelerate the creation of images in a frame buffer intended for output`.
 - Timings: no-split 6.64 pp / 5.36 tg; K=2 split 13.70 pp / 6.32 tg. The split is slightly faster in this small single-GPU config because one expert half moves to the GPU for the GPU-resident layer.
 - This is the first correctness parity result for the per-expert split path.
-- **Next:** decide whether to push this milestone to `nilo85`, then run a bounded dual-GPU parity/perf comparison or move to Q3_K_XL / routing-aware placement.
+- Pushed `us-otgen-expert-ot` to `nilo85` at commit `6a9e94689` after changing the temporary expert-part log to debug level and cleaning the graph signature indentation.
+- **Next:** run a bounded dual-GPU parity/perf comparison or move to Q3_K_XL / routing-aware placement.
