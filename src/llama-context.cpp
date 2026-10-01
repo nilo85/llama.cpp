@@ -1461,7 +1461,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!cparams.dump_routing.empty()) {
+        if (!cparams.dump_routing.empty() || !cparams.moe_heatmap_dump.empty()) {
             for (const auto & cap : routing_captures) {
                 if (cap.second && ggml_graph_size(gf) > ggml_graph_n_nodes(gf)) {
                     // keep the routing tensor alive until after the graph compute so the trace reads valid data
