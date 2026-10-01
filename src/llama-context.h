@@ -300,6 +300,9 @@ private:
     std::ofstream routing_trace;
     mutable std::vector<std::pair<int, ggml_tensor *>> routing_captures;
 
+    // MoE heatmap dump (cparams.moe_heatmap_dump): per-layer expert usage accumulated over the run, dumped on exit
+    std::vector<std::map<int32_t, int64_t>> moe_heatmap_totals;
+
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
 

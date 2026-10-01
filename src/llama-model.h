@@ -841,6 +841,14 @@ struct llama_model_base : public llama_model {
     // an explicit tensor buft override matching `part_name` wins over the default split rule
     ggml_backend_buffer_type_t get_expert_split_buft(int il, int part_idx, const std::string & part_name) const;
 
+    // MoE heatmap placement (params.moe_heatmap): per-layer expert scores and the per-part hot/cold decision
+    // used by get_expert_split_buft (hot -> local GPU, cold -> CPU); empty = disabled
+    std::vector<std::vector<int64_t>> moe_heatmap;
+    std::vector<std::vector<char>>    moe_hot_parts;
+
+    // parse the MoE heatmap file and precompute the hot parts per layer (called from load_tensors)
+    void load_moe_heatmap(int n_expert_parts);
+
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,
                 int64_t n_ff_, int64_t n_expert_, int flags);

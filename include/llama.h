@@ -346,6 +346,10 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // optional: MoE heatmap file driving expert part placement (hot parts -> local GPU, cold -> CPU)
+        const char * moe_heatmap;
+        float        moe_heatmap_fraction;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data
@@ -394,6 +398,9 @@ extern "C" {
 
         // optional: dump per-layer MoE expert routing to FILE (calibration trace, one line per MoE layer per step)
         const char * dump_routing;
+
+        // optional: collect MoE expert usage and dump the full heatmap to FILE on exit (opt-in, per-step readback cost)
+        const char * moe_heatmap_dump;
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]

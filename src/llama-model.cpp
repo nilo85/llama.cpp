@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <numeric>
@@ -1627,7 +1628,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             const int n_expert_parts = atoi(env_split);
             if (n_expert_parts > 1) {
                 ml.reserve_part_tensors(static_cast<int>(hparams.n_layer_all)*3*n_expert_parts);
+
+                if (params.moe_heatmap && params.moe_heatmap[0]) {
+                    load_moe_heatmap(n_expert_parts);
+                }
             }
+        } else if (params.moe_heatmap && params.moe_heatmap[0]) {
+            LLAMA_LOG_WARN("%s: --moe-heatmap requires LLAMA_EXPERT_SPLIT=K>1, ignoring\n", __func__);
         }
 
         layers.resize(n_layer_all);
@@ -2872,6 +2879,8 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.moe_heatmap                 =*/ nullptr,
+        /*.moe_heatmap_fraction        =*/ 0.5f,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
@@ -3338,6 +3347,79 @@ ggml_tensor * llama_model_base::create_expert_part(const LLM_TN_IMPL & tn, const
     return create_tensor(*ml, tn, ne, flags);
 }
 
+void llama_model_base::load_moe_heatmap(int n_expert_parts) {
+    std::ifstream file(params.moe_heatmap);
+    if (!file) {
+        LLAMA_LOG_ERROR("%s: failed to open MoE heatmap file '%s'\n", __func__, params.moe_heatmap);
+        return;
+    }
+
+    const int n_layer  = hparams.n_layer_all;
+    const int n_expert = (int) hparams.n_expert;
+
+    moe_heatmap.assign(n_layer, std::vector<int64_t>(n_expert, 0));
+
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        if (line.rfind("il=", 0) != 0) {
+            continue;
+        }
+        const int il = atoi(line.c_str() + 3);
+        if (il < 0 || il >= n_layer) {
+            continue;
+        }
+        size_t pos = line.find_first_not_of(" \t", 3);
+        while (pos != std::string::npos) {
+            const size_t colon = line.find(':', pos);
+            if (colon == std::string::npos) {
+                break;
+            }
+            const int     expert = atoi(line.c_str() + pos);
+            const int64_t score  = atoll(line.c_str() + colon + 1);
+            if (expert >= 0 && expert < n_expert) {
+                moe_heatmap[il][expert] += score;
+            }
+            pos = line.find_first_not_of(" \t", colon + 1);
+        }
+    }
+
+    // rank each layer's parts by aggregate score; the hottest parts go to the local GPU
+    const int n_hot = std::min(n_expert_parts, (int) (n_expert_parts * params.moe_heatmap_fraction));
+    moe_hot_parts.assign(n_layer, std::vector<char>(n_expert_parts, 0));
+
+    for (int il = 0; il < n_layer; ++il) {
+        std::vector<int64_t> part_scores(n_expert_parts, 0);
+        for (int p = 0; p < n_expert_parts; ++p) {
+            const int e0 = p * (n_expert / n_expert_parts);
+            const int e1 = (p + 1 < n_expert_parts) ? (p + 1) * (n_expert / n_expert_parts) : n_expert;
+            for (int e = e0; e < e1; ++e) {
+                part_scores[p] += moe_heatmap[il][e];
+            }
+        }
+
+        std::vector<int> order(n_expert_parts);
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](int a, int b) { return part_scores[a] > part_scores[b]; });
+        for (int i = 0; i < n_hot; ++i) {
+            moe_hot_parts[il][order[i]] = 1;
+        }
+
+        LLAMA_LOG_DEBUG("%s: layer %3d: hot parts = ", __func__, il);
+        for (int p = 0; p < n_expert_parts; ++p) {
+            if (moe_hot_parts[il][p]) {
+                LLAMA_LOG_DEBUG("%d ", p);
+            }
+        }
+        LLAMA_LOG_DEBUG("\n");
+    }
+
+    LLAMA_LOG_INFO("%s: MoE heatmap from '%s': %d layers x %d experts, %d/%d parts per layer on local GPU\n",
+            __func__, params.moe_heatmap, n_layer, n_expert, n_hot, n_expert_parts);
+}
+
 ggml_backend_buffer_type_t llama_model_base::get_expert_split_buft(int il, int part_idx, const std::string & part_name) const {
     if (ml && ml->tensor_buft_overrides) {
         for (const auto * overrides = ml->tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
@@ -3357,6 +3439,16 @@ ggml_backend_buffer_type_t llama_model_base::get_expert_split_buft(int il, int p
     const buft_list_t * cur_buft_list = pimpl->dev_layer[il].buft_list;
 
     if (ggml_backend_dev_type(cur_dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        GGML_ASSERT(cpu_dev != nullptr);
+        return ggml_backend_dev_buffer_type(cpu_dev);
+    }
+
+    if (!moe_hot_parts.empty() && il >= 0 && il < (int) moe_hot_parts.size()
+            && part_idx >= 0 && part_idx < (int) moe_hot_parts[il].size()) {
+        if (moe_hot_parts[il][part_idx]) {
+            return (*cur_buft_list)[0].second;
+        }
         ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         GGML_ASSERT(cpu_dev != nullptr);
         return ggml_backend_dev_buffer_type(cpu_dev);

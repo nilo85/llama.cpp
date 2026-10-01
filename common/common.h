@@ -495,6 +495,10 @@ struct common_params {
 
     std::string dump_routing; // dump per-layer MoE expert routing to this file (calibration trace)
 
+    std::string moe_heatmap; // MoE heatmap file driving expert part placement (hot -> local GPU, cold -> CPU)
+    std::string moe_heatmap_dump; // dump the full MoE usage heatmap to this file on exit (opt-in)
+    float moe_heatmap_fraction = 0.5f; // fraction of each layer's expert parts placed on the local GPU
+
     ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
 
     enum llama_rope_scaling_type rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;

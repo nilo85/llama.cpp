@@ -65,6 +65,7 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     std::string dump_routing; // optional: dump per-layer MoE expert routing to this file
+    std::string moe_heatmap_dump; // optional: dump the full MoE usage heatmap to this file on exit
 
     llama_context * ctx_other;
 };

@@ -2761,6 +2761,31 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_DUMP_ROUTING"));
     add_opt(common_arg(
+        {"--moe-heatmap"}, "<file>",
+        "load an MoE heatmap (il=<layer> <expert>:<score>) and place hot expert parts on the local GPU, cold on CPU (requires LLAMA_EXPERT_SPLIT)",
+        [](common_params & params, const std::string & value) {
+            params.moe_heatmap = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_HEATMAP"));
+    add_opt(common_arg(
+        {"--moe-heatmap-dump"}, "<file>",
+        "collect MoE expert usage and dump the full heatmap to FILE on exit (opt-in, adds a per-step readback)",
+        [](common_params & params, const std::string & value) {
+            params.moe_heatmap_dump = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_HEATMAP_DUMP"));
+    add_opt(common_arg(
+        {"--moe-heatmap-fraction"}, "F",
+        "fraction of each layer's expert parts placed on the local GPU when using --moe-heatmap (default: 0.5)",
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (f < 0.0f || f > 1.0f) {
+                throw std::invalid_argument("error: --moe-heatmap-fraction must be in [0, 1]");
+            }
+            params.moe_heatmap_fraction = f;
+        }
+    ).set_env("LLAMA_ARG_MOE_HEATMAP_FRACTION"));
+    add_opt(common_arg(
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",
         [](common_params & params) {

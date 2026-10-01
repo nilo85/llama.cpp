@@ -13,9 +13,11 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -141,6 +143,7 @@ llama_context::llama_context(
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
     cparams.dump_routing      = params.dump_routing ? params.dump_routing : "";
+    cparams.moe_heatmap_dump  = params.moe_heatmap_dump ? params.moe_heatmap_dump : "";
 
     cparams.ctx_other = nullptr;
 
@@ -483,6 +486,28 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    if (!cparams.moe_heatmap_dump.empty() && !moe_heatmap_totals.empty()) {
+        std::ofstream file(cparams.moe_heatmap_dump.c_str());
+        if (!file) {
+            LLAMA_LOG_ERROR("%s: failed to open MoE heatmap dump file '%s'\n", __func__, cparams.moe_heatmap_dump.c_str());
+        } else {
+            file << "# MoE heatmap: il=<layer> <expert>:<score> ... (sorted by score desc, placement-independent)\n";
+            for (size_t il = 0; il < moe_heatmap_totals.size(); ++il) {
+                if (moe_heatmap_totals[il].empty()) {
+                    continue;
+                }
+                std::vector<std::pair<int32_t, int64_t>> hits(moe_heatmap_totals[il].begin(), moe_heatmap_totals[il].end());
+                std::sort(hits.begin(), hits.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
+                file << "il=" << il;
+                for (const auto & h : hits) {
+                    file << " " << h.first << ":" << h.second;
+                }
+                file << "\n";
+            }
+            LLAMA_LOG_INFO("%s: dumped MoE heatmap to '%s'\n", __func__, cparams.moe_heatmap_dump.c_str());
+        }
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -2632,25 +2657,35 @@ llm_graph_cb llama_context::graph_get_cb() const {
             }
         }
 
-        // capture the MoE routing for the calibration trace (re-captured on every graph rebuild)
-        if (!cparams.dump_routing.empty() && name && strcmp(name, "ffn_moe_topk") == 0) {
+        // capture the MoE routing for the calibration trace / heatmap dump (re-captured on every graph rebuild)
+        if ((!cparams.dump_routing.empty() || !cparams.moe_heatmap_dump.empty()) && name && strcmp(name, "ffn_moe_topk") == 0) {
             routing_captures.emplace_back(il, cur);
         }
     };
 }
 
 void llama_context::routing_trace_flush() {
-    if (cparams.dump_routing.empty() || routing_captures.empty()) {
+    if (routing_captures.empty()) {
+        return;
+    }
+    bool trace = !cparams.dump_routing.empty();
+    const bool dump = !cparams.moe_heatmap_dump.empty();
+    if (!trace && !dump) {
         return;
     }
 
-    if (!routing_trace.is_open()) {
+    if (trace && !routing_trace.is_open()) {
         routing_trace.open(cparams.dump_routing, std::ios::app);
         if (!routing_trace.is_open()) {
             LLAMA_LOG_ERROR("%s: failed to open routing trace file '%s'\n", __func__, cparams.dump_routing.c_str());
-            return;
+            trace = false;
+        } else {
+            routing_trace << "# il=<layer> <expert>:<count> ... (one line per MoE layer per step)\n";
         }
-        routing_trace << "# il=<layer> <expert>:<count> ... (one line per MoE layer per step)\n";
+    }
+
+    if (dump && moe_heatmap_totals.empty()) {
+        moe_heatmap_totals.resize(model.hparams.n_layer_all);
     }
 
     std::vector<int32_t> buf;
@@ -2678,13 +2713,23 @@ void llama_context::routing_trace_flush() {
             }
         }
 
-        routing_trace << "il=" << cap.first;
-        for (const auto & kv : counts) {
-            routing_trace << " " << kv.first << ":" << kv.second;
+        if (trace) {
+            routing_trace << "il=" << cap.first;
+            for (const auto & kv : counts) {
+                routing_trace << " " << kv.first << ":" << kv.second;
+            }
+            routing_trace << "\n";
         }
-        routing_trace << "\n";
+
+        if (dump && cap.first >= 0 && cap.first < (int) moe_heatmap_totals.size()) {
+            for (const auto & kv : counts) {
+                moe_heatmap_totals[cap.first][kv.first] += kv.second;
+            }
+        }
     }
-    routing_trace.flush();
+    if (trace) {
+        routing_trace.flush();
+    }
 }
 
 //
@@ -3799,6 +3844,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.dump_routing                =*/ nullptr,
+        /*.moe_heatmap_dump            =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,
