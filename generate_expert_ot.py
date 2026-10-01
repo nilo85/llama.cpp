@@ -62,13 +62,19 @@ def proportional_targets(total, weights):
     return targets
 
 
-def assign_parts(scores, k, hot_count, gpus, weights, local_idx, prefer_local):
+def assign_parts(scores, k, hot_count, gpus, weights, local_idx, prefer_local, local_only=False):
     assign = {p: "CPU" for p in range(k)}
     if hot_count <= 0:
         return assign
 
     order = sorted(range(k), key=lambda p: (-scores[p], p))
     top = order[:hot_count]
+
+    if local_only:
+        # M5: hot parts stay on the layer's owning GPU, everything else CPU
+        for p in top:
+            assign[p] = gpus[local_idx]
+        return assign
 
     if prefer_local and len(gpus) > 1:
         local_target = proportional_targets(hot_count, weights)[local_idx]
@@ -118,6 +124,7 @@ def main():
     ap.add_argument("--hot-fraction", type=float, default=0.5, help="fraction of parts per layer placed on GPUs")
     ap.add_argument("--local-split", default="50,50", help="comma-separated weights for the GPU list")
     ap.add_argument("--prefer-local", action="store_true", help="give the layer's local GPU the hottest parts first")
+    ap.add_argument("--local-only", action="store_true", help="M5: hot parts stay on the layer's owning GPU, everything else CPU (never the remote GPU)")
     ap.add_argument("--out", default="placement.ot")
     ap.add_argument("--shell-out", default="", help="also write a bash file defining OT_ARGS")
     args = ap.parse_args()
@@ -154,7 +161,7 @@ def main():
             for p in range(args.k):
                 scores.append(sum(hot[p * part_size:(p + 1) * part_size]))
             local_idx = min(il * len(gpus) // args.n_layers, len(gpus) - 1) if gpus else 0
-            assign = assign_parts(scores, args.k, hot_count, gpus, weights, local_idx, args.prefer_local)
+            assign = assign_parts(scores, args.k, hot_count, gpus, weights, local_idx, args.prefer_local, args.local_only)
 
         for p in range(args.k):
             dev = assign[p]
