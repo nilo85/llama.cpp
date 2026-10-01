@@ -1,6 +1,7 @@
 # us_kvram — KV overflow-to-RAM for deep context (upstream feature, deliberately deprioritized)
 
 **Type:** New ggml-level capability; parked until a measured trigger appears.
+**Priority (2026-09-30):** parked; trigger-based re-evaluation only.
 **Upstream refs:** none open (confirmed absence in research §5 mapping: `-cram` prompt-cache only, no KV-resident/stream split); Strata analog `--kv-resident 32768` (+13.7 KB/tok stream from RAM; Q2_0 @262K: 50.9→62.6 t/s in their 12 GB-GPU case); adjacent merged machinery worth riding someday: #28953/#29459 buffer-placement plumbing, backend alloc-query hooks discussion in #25356/us_25356.
 
 ## Persona
@@ -24,3 +25,13 @@ so context length decouples from leftover VRAM.
 
 ## Definition of done
 Either trigger never fires (document the negative result in research.md and close this story), or upstream design thread opened with bench data attached. No fork.
+
+## TODO (branch: us-kvram-overflow)
+- [ ] Parked story: design doc (docs/) for KV split policy (recent VRAM-resident, rest RAM-streamed)
+- [ ] Minimal API surface: `--kv-ram N` parsed + validated + logged (not yet implemented)
+- [ ] Build SYCL - verify compiles
+- [ ] Test GPU 84:00.0: confirm flag parses; document that trigger (128K OOM) not yet met
+- [ ] Commit frequently; push to nilo85
+
+## Work Log & Resume Context
+_State: NOT STARTED. Update after each step (what was done, key decisions, how to verify/resume)._

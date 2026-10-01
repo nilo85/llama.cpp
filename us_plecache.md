@@ -1,6 +1,7 @@
 # us_plecache — PLE hot-row cache over lazy reads (new contribution, medium)
 
 **Type:** New feature, mainline-compatible plumbing only (mmap/loader path, no ggml changes). Complements us_29030 (do that first; this rides its gather API).
+**Priority (2026-09-30):** P3, after `us_29030` is tested/landed.
 **Upstream refs:** builds on #29030/#29599 gather+prefetch; inspired by Strata's SSD-streamed engram via OS page cache (docs/DETAILS.md: "only randomly row-accessed, few rows/token"); no existing llama.cpp issue found — would be new (search first: `lazy row cache`, `ple cache`).
 
 ## Persona
@@ -25,3 +26,13 @@ so agent loops and long sessions stop re-streaming the same few thousand rows.
 
 ## Definition of done
 Plan accepted into an upstream issue/PR with at least reviewer engagement, or fork patch proven on rig (criterion 3) and recorded in research.md.
+
+## TODO (branch: us-plecache-hot-rows)
+- [ ] Self-contained LFU/LRU row cache over the lazy-read path (loader, no ggml change)
+- [ ] `--lazy-cache-mb N` arg; RAM-resident; default off; bounded eviction
+- [ ] Build SYCL - verify compiles
+- [ ] Test GPU 84:00.0: repeated-prompt pp gain vs no-cache; hit-rate logging
+- [ ] Commit frequently; push to nilo85
+
+## Work Log & Resume Context
+_State: NOT STARTED. Update after each step (what was done, key decisions, how to verify/resume)._
