@@ -377,16 +377,23 @@ sudo podman run -d --name ab-test --cgroups=enabled --log-driver=journald \
   --n-gpu-layers 48 --split-mode layer --tensor-split 50,50
 ```
 
-⚠️ **Both B70s are normally in production use.** The old "use only GPU 1 / never
-touch GPU 0" rule is superseded: for dedicated GPU tests, stop
+⚠️ **Both B70s are normally available to production.** The old "use only GPU 1 /
+never touch GPU 0" rule is superseded: for dedicated **dual-GPU** tests, stop
 `podman-llama-cpp-qwen3.8-27b.service` with `sudo systemctl`, verify
 `litellm-failover.service` remains active, run the test on both GPUs, then restart
-the 27B service and check `:8006/health`. A test container that does not stop the
-27B will contend for VRAM and GPUs. Stopping the 27B also frees host RAM held by
-its CRAM/KV/compute buffers, so re-check `free -h` in the stopped state before
-judging RAM-heavy tests. If you see OOM or
+the 27B service and check `:8006/health`. A dual-GPU test container that does not
+stop the 27B will contend for VRAM and GPUs. Stopping the 27B also frees host RAM
+held by its CRAM/KV/compute buffers, so re-check `free -h` in the stopped state
+before judging RAM-heavy tests. If you see OOM or
 `UR_RESULT_ERROR_OUT_OF_RESOURCES`, suspect contention before suspecting your
-flags. `--fit` is also unusable when `-ngl` is set: it aborts with *"failed to fit
+flags.
+
+**Single-GPU exception:** the 27B service is bound to `renderD129` (GPU0). A
+single-GPU dev/test container that uses only `renderD130` (the PCIe 4 attached
+B70) can leave the 27B service running. Stop the 27B service only when the test
+needs `renderD129` or both GPUs.
+
+`--fit` is also unusable when `-ngl` is set: it aborts with *"failed to fit
 params to free device memory: n_gpu_layers already set by user to 48, abort"*, so
 **always pass `-ngl 48` explicitly** and size things yourself. For qwen4exp MTP
 shared-draft runs, use `--fit off` because fitting cannot measure the draft
@@ -482,9 +489,11 @@ baselines, use `llama-cli` with bounded `-c` (for example `-c 4096 -n 256`) and
 7. **`--fit` is unusable** when `-ngl` is set; size explicitly.
 8. **Both GPUs are shared with production unless you stop the 27B service.**
    Use `sudo systemctl stop podman-llama-cpp-qwen3.8-27b.service` for dedicated
-   GPU tests, never stop `litellm-failover.service`, and restart the 27B after
-   the test. Do not leave the 27B service stopped during docs/code review or any
-   non-GPU work; restart it as soon as the GPU test window ends.
+   **dual-GPU** tests, never stop `litellm-failover.service`, and restart the 27B
+   after the test. Do not leave the 27B service stopped during docs/code review or
+   any non-GPU work; restart it as soon as the dual-GPU test window ends.
+   Single-GPU tests on `renderD130` may leave the 27B service running because it
+   is bound to `renderD129`.
 9. **nixpkgs `intel-llvm` has no `icpx`** and needs OpenCL headers for `CL/cl.h`.
 10. **Do not use `--split-mode row`** on SYCL (silent no-op).
 11. **Do not use the iGPU** (`0000:00:02.0`, `card1`) for offload — see §7.

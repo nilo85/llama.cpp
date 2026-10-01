@@ -81,7 +81,7 @@ Tool exists in this workspace with a `--help` matching the emitted-format spec, 
 - Cross-backend adds for the per-part outputs may add latency; the win depends on hot-expert residency.
 
 ## Work Log & Resume Context
-_State: PER-EXPERT M1 CODE DRAFT ON `us-otgen-expert-ot` 2026-10-01; loader, graph, and Qwen4exp wiring are in place. Normal iteration now uses a mounted SYCL build dir (host-info.md Path E) instead of rebuilding the podman image. CPU compile check passed; mounted SYCL build + GPU validation pending._
+_State: PER-EXPERT M1 BUGFIX ON `us-otgen-expert-ot` 2026-10-01; loader, graph, and Qwen4exp wiring are in place. K=8 Q3/Q2 dual-GPU OOM traced to a `SYCL_Host` CPU fallback and to the tested GGUF storing separate `ffn_gate_exps`/`ffn_up_exps` tensors instead of fused `ffn_gate_up_exps`. Fixed CPU buffer selection and separate gate/up part creation; single-GPU validation pending._
 
 ### 2026-10-01 — Design + branch strategy (agreed with user)
 - **Goal:** replace static layer-uniform `-ot` placement with workload-calibrated expert placement. Trace per-layer MoE routing over a representative pass, rank expert hotness, solve a VRAM-budget knapsack split proportional to per-device bandwidth, emit an `-ot` pattern file.
@@ -149,3 +149,15 @@ _State: PER-EXPERT M1 CODE DRAFT ON `us-otgen-expert-ot` 2026-10-01; loader, gra
 - Next validation should either use Q2_K_XL with K=8 to prove the graph transform, or reduce Q3_K_XL GPU scope (`-ngl` smaller / larger K) until it fits.
 - Fixed `llama_model_base::get_expert_split_buft()` to assign distinct candidate backends by part index: local device, then other GPUs, then CPU. The previous version sent both part 1 and part 2 to the same remote GPU, so `LLAMA_EXPERT_SPLIT=3` would not create a CPU partition.
 - **Next:** run the Path E mounted SYCL build, then stop the 27B service for a bounded GPU parity/perf test with `LLAMA_EXPERT_SPLIT=3`, then restart the 27B service.
+
+### 2026-10-01 - Q2 K=8 OOM, verbose part logging, two placement bugs found
+- Ran Q2_K_XL K=8 dual-GPU with `-ngl 48`; it still OOMed during SYCL device buffer allocation.
+- Added temporary `LLAMA_LOG_INFO` to the loader `part_spec` path to print each synthetic expert part name, buffer type, byte size, and offset, then rebuilt `llama-cli` in the mounted SYCL build dir.
+- Verbose Q2_K_XL K=8 log shows:
+  - original `ffn_down_exps.weight`, `ffn_gate_exps.weight`, and `ffn_up_exps.weight` tensors are skipped as unused, so the old full fused tensor path is not the OOM source;
+  - parts intended for CPU were assigned `SYCL_Host` because `get_expert_split_buft()` fell back to `cpu_buft_list[0]`, which can be a GPU-associated host buffer;
+  - `ffn_gate_up_exps.weight.partN` offsets are all zero because the tested unsloth UD GGUF has separate `ffn_gate_exps.weight` and `ffn_up_exps.weight` tensors, not a fused `ffn_gate_up_exps.weight` tensor.
+- Fixed `llama_model_base::get_expert_split_buft()` to return the real CPU buffer type for CPU layers and for parts beyond the available remote GPUs, instead of using `cpu_buft_list[0]`.
+- Updated the Qwen4exp expert-split loader path to create separate `ffn_gate_exps.weight.partN` and `ffn_up_exps.weight.partN` tensors when fused `ffn_gate_up_exps.weight` is absent; the graph already supports separate gate/up part vectors.
+- 27B service topology: `podman-llama-cpp-qwen3.8-27b.service` uses `--device=/dev/dri/renderD129` (GPU0). Single-GPU dev tests can use the PCIe 4 attached B70 (`renderD130`) while the 27B service stays up; stop the 27B service only for tests that require both GPUs.
+- **Next:** rebuild the mounted SYCL `llama-cli`, run a low-risk single-GPU validation on `renderD130` with small `-ngl`/K while 27B is up, then stop 27B and run dual-GPU Q2_K_XL K=8.
