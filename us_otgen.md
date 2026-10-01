@@ -69,6 +69,8 @@ Tool exists in this workspace with a `--help` matching the emitted-format spec, 
    The per-part outputs are summed to produce the layer's `moe_out`. Because the FFN is applied per selected-expert row and remote rows are zeroed, summing the per-part final outputs is mathematically identical to the unpartitioned graph.
 3. **Vendor agnosticism:** no backend kernel changes. Each part is a normal tensor on a normal backend buffer; the existing scheduler handles cross-backend adds. The same design works for CPU, SYCL, CUDA, or any other backend combination.
 
+**Warm/cold compatibility:** the uniform `LLAMA_EXPERT_SPLIT=K` path is only an M1 validation scaffold. The long-term goal remains routing-calibrated warm/cold placement (hot experts on GPU, cold experts on CPU). The loader/graph substrate is range-based: each part has a name, byte offset, expert offset, and buffer type. A later placement file can therefore replace the uniform K loop with arbitrary per-layer contiguous ranges and devices. Scattered hot experts can be emitted as multiple small contiguous ranges; if part-count overhead becomes a problem, we can add gathered parts or expert reordering, but the current contiguous-range mechanism is not a dead end for warm/cold placement.
+
 **Planned milestones:**
 - M1: hardcoded 2-way expert split (GPU0/GPU1) for Qwen3.8-Flash-Next to prove correctness/perf.
 - M2: CLI/file plumbing for arbitrary per-layer expert ranges and backends.
@@ -81,7 +83,7 @@ Tool exists in this workspace with a `--help` matching the emitted-format spec, 
 - Cross-backend adds for the per-part outputs may add latency; the win depends on hot-expert residency.
 
 ## Work Log & Resume Context
-_State: PER-EXPERT M1 BUGFIX ON `us-otgen-expert-ot` 2026-10-01; loader, graph, and Qwen4exp wiring are in place. K=8 Q3/Q2 dual-GPU OOM traced to a `SYCL_Host` CPU fallback and to the tested GGUF storing separate `ffn_gate_exps`/`ffn_up_exps` tensors instead of fused `ffn_gate_up_exps`. Fixed CPU buffer selection and separate gate/up part creation; single-GPU validation pending._
+_State: PER-EXPERT M1 VALIDATION + SINGLE-GPU PARITY PASSED ON `us-otgen-expert-ot` 2026-10-01; loader, graph, and Qwen4exp wiring are in place. Q2_K_XL K=2 passes single-GPU `-ngl 2`, dual-GPU `-ngl 48`, and single-GPU greedy parity against the unsplit path. Next is push decision / dual-GPU parity or Q3 / routing-aware placement._
 
 ### 2026-10-01 — Design + branch strategy (agreed with user)
 - **Goal:** replace static layer-uniform `-ot` placement with workload-calibrated expert placement. Trace per-layer MoE routing over a representative pass, rank expert hotness, solve a VRAM-budget knapsack split proportional to per-device bandwidth, emit an `-ot` pattern file.
@@ -158,6 +160,38 @@ _State: PER-EXPERT M1 BUGFIX ON `us-otgen-expert-ot` 2026-10-01; loader, graph, 
   - parts intended for CPU were assigned `SYCL_Host` because `get_expert_split_buft()` fell back to `cpu_buft_list[0]`, which can be a GPU-associated host buffer;
   - `ffn_gate_up_exps.weight.partN` offsets are all zero because the tested unsloth UD GGUF has separate `ffn_gate_exps.weight` and `ffn_up_exps.weight` tensors, not a fused `ffn_gate_up_exps.weight` tensor.
 - Fixed `llama_model_base::get_expert_split_buft()` to return the real CPU buffer type for CPU layers and for parts beyond the available remote GPUs, instead of using `cpu_buft_list[0]`.
+- Refined the placement rule: CPU layers keep all expert parts on CPU. Remote-GPU expert parts are used only when the layer itself is on a GPU. This avoids a small `-ngl` single-GPU test from filling the one visible GPU with remote parts from many CPU layers.
 - Updated the Qwen4exp expert-split loader path to create separate `ffn_gate_exps.weight.partN` and `ffn_up_exps.weight.partN` tensors when fused `ffn_gate_up_exps.weight` is absent; the graph already supports separate gate/up part vectors.
 - 27B service topology: `podman-llama-cpp-qwen3.8-27b.service` uses `--device=/dev/dri/renderD129` (GPU0). Single-GPU dev tests can use the PCIe 4 attached B70 (`renderD130`) while the 27B service stays up; stop the 27B service only for tests that require both GPUs.
-- **Next:** rebuild the mounted SYCL `llama-cli`, run a low-risk single-GPU validation on `renderD130` with small `-ngl`/K while 27B is up, then stop 27B and run dual-GPU Q2_K_XL K=8.
+- Rebuilt the mounted SYCL `llama-cli` successfully after the CPU-buffer and separate gate/up fixes.
+- Clarified design compatibility: the uniform `LLAMA_EXPERT_SPLIT=K` behavior is only a validation scaffold; the warm/cold goal can use the same range-based part/subgraph substrate with arbitrary per-layer ranges/devices from a later placement file.
+- First single-GPU Q2_K_XL K=2 `-ngl 2` run on `renderD130` segfaulted. The temporary part log showed separate gate/up parts with non-zero offsets and CPU buffer type, but every part reported ~1.67 GB (F32-sized) instead of the expected Q2-sized slice.
+- Root cause: the loader `part_spec` path used `gguf_find_tensor(metadata, ...)`, but for split GGUFs `metadata` is only the first shard. Tensors that live in later shards were not found, so the synthetic part fell back to `GGML_TYPE_F32` and allocated a huge buffer.
+- Fixed the `part_spec` path to take the tensor type from the `weights_map` original tensor when available, with the old `gguf_find_tensor` path only as a fallback, and added the tensor type to the temporary part log.
+- Second single-GPU run got past the F32 sizing bug but aborted in `ggml_new_object: not enough space in the context's memory pool`. The per-buft ggml context was sized from the current `n_part_tensors` value, which is still small when the first part tensor creates the context, so later part tensors exhaust the metadata pool.
+- Fixed `ctx_for_buft()` to reserve a larger metadata pool once expert-part creation is in use (`part_spec.name` non-empty or `n_part_tensors > 0`), matching the existing virtual-model margin pattern.
+- Third run still hit the same metadata-pool abort because the CPU ggml context had already been created for ordinary CPU tensors before the first expert part set `part_spec.name`. The fix must reserve part-tensor capacity before tensor loading starts.
+- Added `llama_model_loader::reserve_part_tensors()` and made `llama_model_base::load_tensors()` reserve an upper bound of `n_layer_all*3*LLAMA_EXPERT_SPLIT` synthetic tensors before `load_arch_tensors()` runs.
+- **Next:** rebuild, rerun the single-GPU Q2_K_XL K=2 `-ngl 2` validation on `renderD130`, then stop 27B and run dual-GPU Q2_K_XL.
+
+### 2026-10-01 - Single-GPU Q2 K=2 validation passed
+- Rebuilt the mounted SYCL `llama-cli` after the reserve-part-tensors fix.
+- Ran Q2_K_XL K=2 `-ngl 2` on `renderD130` with `-c 2048`, `-n 16`, `-np 1`, mmap, greedy, while the 27B service remained up on `renderD129`.
+- Result: exit 0, coherent output (`A GPU (Graphics Processing Unit) is a specialized electronic circuit designed to rapidly manipulate`, stopped by the 16-token limit), prompt eval 6.20 t/s, generation 4.22 t/s.
+- The part log now shows correct quantized types and sizes: down parts are `iq4_nl` at ~235.9 MB each, gate/up parts are `iq2_xs`/`iq3_xxs` at the expected per-part sizes, offsets are non-zero for part 1, and GPU-layer part 0 is on `SYCL0` while the remaining parts are on CPU.
+- The earlier `2/K` capacity note applied to the old placement rule where CPU layers could send remote parts to GPUs. With the refined rule (CPU layers keep all parts on CPU; GPU layers use local + remote GPU parts), a balanced all-GPU dual-GPU split puts about `1/K` of routed experts on each GPU.
+- **Next:** stop `podman-llama-cpp-qwen3.8-27b.service`, run a bounded dual-GPU Q2_K_XL validation with `-ngl 48`, then restart the 27B service as soon as the test window ends.
+
+### 2026-10-01 - Dual-GPU Q2 K=2 validation passed
+- Stopped `podman-llama-cpp-qwen3.8-27b.service`, ran Q2_K_XL K=2 with both B70 devices, `-ngl 48`, `--split-mode layer --tensor-split 50,50`, mmap, `-c 4096`, `-n 32`, greedy, then restarted the 27B service.
+- Result: exit 0, coherent output, prompt 25.60 t/s, generation 16.51 t/s.
+- Memory breakdown after context allocation: SYCL0 ~23.5 GiB used, SYCL1 ~23.5 GiB used, Host ~28.9 GiB used. No Level Zero OOM and no ggml context-pool abort.
+- Part log confirms the intended placement: CPU layer 0 keeps both expert parts on CPU; GPU layers split part 0 to the owning GPU and part 1 to the other GPU.
+- This proves the M1 per-expert split path is functional for Q2_K_XL on the 2x32GB rig. The next useful step is parity/quality against the unsplit path, then a larger validation with Q3_K_XL or a performance-focused bounded test.
+
+### 2026-10-01 - Single-GPU Q2 K=2 parity passed
+- Ran the same Q2_K_XL `-ngl 2` prompt with `-n 32`, greedy, seed 1, on `renderD130` while the 27B service stayed up: once without `LLAMA_EXPERT_SPLIT` and once with `LLAMA_EXPERT_SPLIT=2`.
+- Both runs produced the same 32-token output: `A GPU (Graphics Processing Unit) is a specialized electronic circuit designed to rapidly manipulate and alter memory to accelerate the creation of images in a frame buffer intended for output`.
+- Timings: no-split 6.64 pp / 5.36 tg; K=2 split 13.70 pp / 6.32 tg. The split is slightly faster in this small single-GPU config because one expert half moves to the GPU for the GPU-resident layer.
+- This is the first correctness parity result for the per-expert split path.
+- **Next:** decide whether to push this milestone to `nilo85`, then run a bounded dual-GPU parity/perf comparison or move to Q3_K_XL / routing-aware placement.
