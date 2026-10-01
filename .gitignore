@@ -1,0 +1,6 @@
+# Raw session exports — contain session IDs, message IDs and absolute paths
+ses_*.json
+session-ses_*.md
+
+# Local machine infrastructure
+ssh-shell.sh

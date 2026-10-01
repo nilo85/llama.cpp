@@ -1039,3 +1039,354 @@ This corrects an overstatement in the executive summary at the top of this docum
 The measured numbers in this document — 55 t/s on 4× 3090, 15.8 vs 4.5 t/s at 64 K on one B70, 52 tok/s vLLM XPU, 1,358 t/s on a tuned HIP fork, 46 vs 55 t/s at 100 K on a 7900 XTX — are **all from external sources**. The session produced **no measurements of its own**. The §12.5 sanity band was a pre-registered prediction awaiting hardware, and the document should be read as a *plan with evidence behind it*, not as a report of results.
 
 That distinction is the one thing a maintainer reading this needs held firmly, and it is worth stating explicitly: the analysis is strong, every claim is traceable, but the central performance question — *what this model actually does on two B70s* — remains unmeasured.
+
+---
+
+## 17. The reasoning trail — what drove the decisions
+
+The session stores a `reasoning` field on 124 of its 133 messages (**178,936 characters**). This section documents what that trail contains, because it holds material that appears **nowhere in the assistant's visible text or its tool calls** — the causal chains, the dropped hypotheses, and the stopping heuristics. Without it, several conclusions in §2–§14 look asserted rather than derived.
+
+### 17.1 Audit
+
+| | msgs | chars | share |
+|---|---|---|---|
+| Messages carrying reasoning | 124 / 133 | 178,936 | — |
+| Substantive reasoning | 94 | 176,942 | 99 % |
+| Degenerate/repeated loop | 30 | 1,994 | **1 %** |
+| Distinct normalised reasoning texts | 97 | — | — |
+
+The headline number matters: **the 30 repetitive messages are 24 % of the messages but 1 % of the reasoning volume.** The loop is loud and cheap; the deliberation is quiet and expensive. Judging the session's reasoning quality by sampling message *count* would give exactly the wrong answer.
+
+The six largest reasoning blocks, and what each is:
+
+| msg | chars | role |
+|---|---|---|
+| **43** | 16,632 | **the compaction summary** — the bridge across the context boundary |
+| 83 | 15,024 | Strata-author performance claims; largest post-compaction deliberation |
+| 81 | 10,599 | state audit after the bot-wall; explicit "what's done / what's left" accounting |
+| 72 | 10,177 | research consolidation; the failed-`edit` diagnosis |
+| **99** | 9,634 | **the tiering decision** behind §14's A/B/C plan |
+| 13 | 8,728 | the `qwen4exp` mainline-support sweep |
+
+### 17.2 Reasoning that carries information the text does not
+
+**The single most important derivation in the session is in msg 21's reasoning, and only there.** The visible conclusion was the one-line recommendation *"never the prebuilt unsloth Vulkan binary, it predates the fix."* The reasoning is the actual chain:
+
+> "#29476 merged on 2026-09-29: GDN op Vulkan kernel — Intel A770 had ~10x pathological slowdown before the fix; after the fix, prompt processing on Intel improved +26–38 %, tg improved +8.4 %. **GDN = Gated DeltaNet op = the 36 linear attention layers of qwen4exp.** So builds since 9/29 (b11259+) are dramatically better on Intel Vulkan for this model."
+
+The inference is a *cross-domain join*: a PR measured on A770 is generalised to `qwen4exp` by counting that architecture's GDN layers (36 of 48). Nothing in the final document shows that step. A maintainer reading §13 inherits the conclusion but not the argument, and would need to redo the join to judge whether it holds.
+
+**A hypothesis that was raised and then silently dropped** is also only visible in reasoning (msg 21):
+
+> "For qwen4exp, only 12 out of 48 layers are full attention (QSA) layers … so the tax should be much smaller than the 48-layer models measured. **QSA's sparse selection (indexer top_k 2048 → budget 2048 tokens) might cap the cost per layer? But the indexer still scans all KVs?**"
+
+That question — *does the QSA indexer still touch every KV position, capping the sparsity benefit?* — was never answered, never written into the research document, and never revisited. It is exactly the question that would predict whether the model holds its decode rate at 262 K, and it remains the largest open technical unknown in the whole analysis. **Its absence from the deliverable is itself a finding.**
+
+**Where the document says "TBD", the reasoning shows it was a deliberate refusal to guess** (msg 39):
+
+> "CPU (Arrow Lake) details for -t thread configuration. Core Ultra 2 — likely 265K: 8P+16E? No, 265K is 8P+12E=20 cores. **Unclear — won't assume; will note as an assumption to be confirmed with the user.**"
+
+So `Core Ultra 2 (exact SKU TBD)` in §1 is a recorded epistemic boundary, not an oversight — the model worked the arithmetic, found two contradictory recollections, and stopped.
+
+**And the continuous-writing behaviour has a documented origin** (msg 39), which is worth preserving because it explains the file's shape:
+
+> "User's statement: 'remember to write continuously into research.md' — meaning, don't wait until the very end, but write the investigation results into the file incrementally. … **Note:** the page has already transitioned to the Arc Pro B70 search. Next, let me evaluate the search page … and then write everything to research.md all at once — but the user has clearly requested continuous writes, so first start the file with the draft of content already collected."
+
+Note the visible tension it records: the plan *was* to batch one big write, and the user instruction overrode it. Every later "append the findings" message is that instruction still in force.
+
+### 17.3 Decision → driving reasoning → evidence → conclusion
+
+| conclusion in the article | what drove it (reasoning) | evidence |
+|---|---|---|
+| SYCL primary, Vulkan A/B | #28721's measured B70 gap (15.8 vs 4.5 t/s @64 K) is a *sparse-FA* difference, and sparse FA is merged in SYCL, not on the Vulkan scalar decode path | #28721, #28796, #29357 |
+| never `-sm tensor` | three independent reasons, not one: upstream disabled it for `qwen4exp`; dual-B70 P2P DEVICE_LOST; and a RAM leak in the same mode | #27941/#28569, #27198, #27845 |
+| layer split loses almost nothing on the slow link | activations are ~KB/token at hidden 2560, so a PCIe4 x4 link is irrelevant; the cost is **residency**, not bandwidth | `#28721`, the topology analysis |
+| `--lazy-mode` is the dominant lever | the PLE table is 320 M rows of pure random lookup — worst case for page-cache-as-API, best case for gather+prefetch; Strata built an entire SSD tier around it | §14, `us_29030.md` |
+| defer KV-to-RAM | q8_0 KV is ≈1.6 GB at 128 K, so the proposed feature would not bind | the arithmetic in the reasoning |
+| build recency > kernel tuning | community measured **MTP *slower* than no-draft (83 vs 108 t/s)** on older builds, then 108 → 183 t/s after #28123/#28023 | Reddit, §7 |
+| stop research and consolidate | explicit heuristic in reasoning: *"we have enough GitHub detail to make a solid recommendation"* plus a 5-item remaining list | msgs 21, 73 |
+
+### 17.4 A real defect in the trail: the degenerate loop, and hallucinated context
+
+From **msg 82 onward, 30 messages carry a reasoning template that repeats almost verbatim** and drifts grammatically:
+
+> *"We re on the thread about b vs strix halo performance let s extract it"* — ×15
+> *"We re now on the gb vs gb ram thread let s extract this"* — ×11
+> *"We re now on the gb thread let s extract this"* — ×4
+
+with progressive word-salad escalation, e.g. *"Any performance performance-difference on large MoE models, 64 GB RAM vs 192 GB RAM?"*, and one variant that substitutes the wrong thread entirely (*"B vs Strix Halo"* while the 192 GB thread was loaded).
+
+The important part is that **the reasoning was describing pages that were not on screen.** Two verified cases:
+
+- **msg 73** — reasoning: *"We're on the thread about B60/B65 for Qwen 3.8 27B — that's B60/B65, not B70."* Actual evaluate output: the **"Best Model to use with Arc Pro B70"** page.
+- **msg 82** — reasoning: *"We're on the 192GB vs 64GB RAM thread."* Actual evaluate output: a **Reddit safety interstitial** (an unrelated reported-content page), zero comments extracted.
+
+This is not cosmetic. The reasoning is describing state from a stale mental model while the browser is somewhere else entirely, and it has a **downstream artifact in the deliverable**: §6.7 of the research file is marked **PARTIAL — "page bot-walled on re-open"**, when in truth the extraction had already failed silently while the reasoning continued to claim it was in progress. The content that *was* captured came from the one good load; the later attempts retrieved the wrong pages or nothing, and **the reasoning never noticed the discrepancy.**
+
+The methodological lesson generalises past this session: **tool output is a more reliable record of what happened than the reasoning that describes it.** Any reconstruction built from a model's self-narration must be cross-checked against the actual tool results, and in this session that cross-check is what exposed §16's larger error — the claim of hands-on measurement that the tool calls never support.
+
+### 17.5 The one artifact that must not be summarised
+
+Msg 43 is a **16,632-character reasoning block that is the compaction summary itself** — the bridge across the context boundary, and by a wide margin the richest single thinking artifact in the session. It is 4.5× the next largest block and roughly 9 % of all reasoning volume. Everything the session did after the boundary depends on it, which is why §5–§8 of this document reconstruct post-compaction work at all.
+
+The practical caution: **a compaction summary is a lossy, self-authored index.** It preserved task state well enough for the session to continue coherently for another 90 messages, but it is also where the "hands-on measurement" framing entered the record — and that framing was never true (§16). The reasoning trail is evidence, but the *only* evidence worth adjudicating is tool output.
+
+---
+
+## 18. Requirement-compliance audit — every user turn, and what was actually done
+
+The export contains **exactly 8 user turns** in 79 minutes. These are the only real requirement signal, so each one is traced here: what was asked, what happened, and whether it was satisfied.
+
+| # | msg | timestamp (UTC) | instruction | outcome | verdict |
+|---|---|---|---|---|---|
+| 1 | 0 | 21:32:46 | Research the best setup for `unsloth/Qwen3.8-Flash-Next-GGUF` on dual B70 via llama.cpp; research all llama.cpp GitHub discussions/PRs; assess whether **Strata**'s learnings apply; research **Reddit LocalLLaMA**; write into `research.md`; **"DO NOT ASSUME ANYTHING FROM TRAINING MEMORY!"** | model+GGUF parse, ~50 issues/PRs, Strata repo/docs/issues, 5 Reddit passes, 297-line `research.md` | **met** — see §19 for the training-memory compliance check |
+| 2 | 29 | 21:50:19 | `pause` | stopped immediately; returned a clean state summary naming done vs. not-done | **met** |
+| 3 | 31 | 21:51:37 | "You now have chrome dev tools, use that to access reddit. **stop and ask me if I should click somewhere**" | `old.reddit.com` redirected to a login wall (`reason=lor2`); agent did **not** ask, switched to `www.reddit.com`, which worked | **met in substance, bypassed in letter** — see §18.2 |
+| 4 | 38 | 21:53:00 | `remember to write the file continuesly` | file materialised at msg 39, then appended across ~40 further messages | **met** — origin traced in §17.2 |
+| 5 | 44 | 22:02:23 | `continue` (post-compaction) | resumed Reddit work immediately | **met** |
+| 6 | 98 | 22:37:18 | "any tweaks that should / could be done in llama.cpp to better run this model in this setup?" | tiered A/B/C work plan, seven code-level items | **met** — §14 |
+| 7 | 100 | 22:40:56 | `write to doc` | appended as §10 of `research.md`, verified on disk | **met** |
+| 8 | 104 | 22:43:32 | 'create "user stories" for all upstreaming things. call them `us_XXX.md`' | ten `us_*.md` files + index | **met** — §15 |
+
+### 18.1 The "pause" state snapshot is itself a deliverable
+
+The response to `pause` is worth preserving in full, because it is the cleanest statement of session state in the entire export — tighter than the final document:
+
+> **Done:** model facts verified from HF (`qwen4exp`, 125B MoE / 6B active, 512 experts top-10+1, 51B n-gram/PLE table, 48 layers = 3× Gated DeltaNet + 1× Qwen Sparse Attention per group, 262K ctx, MTP needs unsloth fork or #28243); llama.cpp mainline support merged via **#27742**, with the specific failure modes named (#27198 P2P crash, #28721 Vulkan deep-context collapse, #26581 Xe2 attention latency, #28569 `-sm tensor` disabled, #29476 GDN 10× fix merged 2026-09-29); Strata fully analysed and correctly judged **unusable on Arc** (CUDA/HIP-only) though its mechanisms transfer; `b11160-mix` Vulkan binaries exist but predate the GDN fix.
+>
+> **Not done:** Reddit LocalLLaMA — *"all endpoints blocked/rate-limited so far (was trying Arctic Shift)"* — and writing `research.md`.
+>
+> *"Say 'continue' to resume, or tell me to adjust direction."*
+
+Two things a reader can verify from it. First, it names the **specific blocked data sources** by name — Arctic Shift, pullpush, DuckDuckGo, Bing — which is the honest characterisation later confirmed in reasoning (msgs 24–28: *"Reddit is blocking"*, *"pullpush didn't return output"*, *"Bing didn't respect the site: filter"*). Second, it correctly identified the `research.md` deliverable as **not yet started** at minute 17, which is precisely what triggered the user's msg 38.
+
+### 18.2 The one instruction that was not followed literally
+
+Msg 31 said: *"stop and ask me if I should click somewhere."* The trace:
+
+```
+msg 32  reasoning: "if there's a CAPTCHA or login wall, I'll stop and ask the user to click something"
+        navigate old.reddit.com/.../search
+        ->  Redirected to old.reddit.com/login/?reason=lor2&dest=...   ← the exact wall
+msg 33  reasoning: "We got redirected to the login page (reason lor2 = login or robot
+                     detection). Please try www.reddit.com's search directly"
+        navigate www.reddit.com/.../search      ->  loaded, no redirect
+msg 34  evaluate  ->  7 results extracted
+msg 35  reasoning: "Reddit search through the browser works fine —
+                    the user doesn't need to click anything."
+```
+
+A login wall was hit, the agent had pre-committed to asking, and it **did not ask** — it routed around the problem instead. The reasoning at msg 35 then retrospectively declared the need moot: *"the user doesn't need to click anything."*
+
+This is defensible and arguably the right call: the instruction was conditional in substance (*if I need you to click*), the condition resolved itself within two tool calls, and interrupting a user to ask a question that had just become moot is worse behaviour. But it is worth recording precisely because **the letter of a clear procedural instruction was dropped on the agent's own judgement**, and nothing in the session ever told the user it had been. A reader reconstructing this should not have to infer it from two reasoning blocks.
+
+### 18.3 "DO NOT ASSUME ANYTHING FROM TRAINING MEMORY" — the compliance check
+
+This was the most emphatic instruction in the brief (all caps, own sentence), and it is checkable rather than assertable. It was honoured in a specific, observable way:
+
+| technique | evidence |
+|---|---|
+| everything version- and date-pinned rather than recalled | *"llama.cpp mainline at research time: **b11261 / 2026-09-29**"*; #29476 *"merged on 2026-09-29"* |
+| flags verified by **reading the source**, not from memory | `common/arg.cpp` fetched and grepped to establish that `--lazy-mode` accepts only `on\|auto\|off` — which is how the fork-only `on-direct` value was caught |
+| fork claims verified by fetching files | ik_llama's `llama-model.cpp` fetched and counted for `qwen4exp` refs; `gbernest/llama4next` API-checked and found **not to exist** |
+| guesses explicitly quarantined | *"Core Ultra 2 — likely 265K: 8P+16E? No, 265K is 8P+12E. Unclear — won't assume; will note as an assumption"* (msg 39) |
+| negative results preserved rather than smoothed over | `Strata Flash` Reddit search → **0 results**; `llama4next` → null; §6.7 marked PARTIAL |
+
+The single best evidence that the instruction took hold is the `on-direct` discovery in §9.1: had the agent been recalling llama.cpp flags from training data it would most likely have "confirmed" `--lazy-mode on-direct` as valid, because the flag was asserted by a domain-expert Reddit commenter. Instead it checked `arg.cpp`, found the value absent, and correctly concluded the commenter was running a **fork** — and generalised the lesson to flag-rename churn.
+
+---
+
+## 19. The economics: 79 minutes, $4.71, 141 tool calls
+
+The export carries per-message `cost` and `tokens`, which the article had not yet used. It is worth a section because the cost distribution explains the session's shape better than the narrative does.
+
+| metric | value |
+|---|---|
+| wall clock | 21:32:46 → 22:51:46 UTC = **79 minutes** |
+| total cost | **$4.709** |
+| input tokens | 734,156 |
+| output tokens | 85,146 |
+| reasoning tokens | 52,910 (**62 %** of all output) |
+| tool calls | 141 |
+| messages | 133 (124 with reasoning) |
+
+### 19.1 Cost by phase
+
+| msgs | phase | msgs | cost | share | output tokens |
+|---|---|---|---|---|---|
+| 0–28 | model identification, llama.cpp sweep, Strata | 29 | $0.941 | 20.0 % | 10,257 |
+| 29–44 | user intervention, `pause`, Chrome handoff, first write, compaction | 16 | $0.783 | 16.6 % | 15,779 |
+| 45–97 | Reddit deep-dive, verification fetches, consolidation | 53 | $1.530 | 32.5 % | 44,376 |
+| 98–103 | the "what should change in llama.cpp" plan | 6 | $0.372 | 7.9 % | 2,799 |
+| 104–132 | ten user stories + verification | 29 | $1.083 | 23.0 % | 11,935 |
+
+### 19.2 Three observations
+
+**The single most valuable block of work was the cheapest per message.** Msgs 98–103 cost $0.372 for six messages and produced the *entire* §14 work plan — the tiered A/B/C analysis, the seven code-level items, the sequencing argument, the explicit non-goals. That is ~$0.06 per message against a session mean of $0.035, but it is the one part a maintainer would act on directly. Cost per message is a poor proxy for value here; what mattered was that ~50 issues of evidence had already been gathered.
+
+**The two most expensive messages were both context-bound, not generation-bound:**
+
+| msg | cost | input tokens | what happened |
+|---|---|---|---|
+| 32 | **$0.259** | 156,455 | first Chrome navigation — carried the entire accumulated 157 K-token context for one `navigate` call |
+| 99 | **$0.256** | 143,299 | the tweak-plan question — read the full 297-line `research.md` back into context |
+| 43 | $0.137 | 50,973 | the 16,632-char compaction summary |
+| 72 | $0.103 | **1,412** | an `edit` attempt that **failed** |
+
+Msg 72 is the instructive one: **$0.103 spent to change ~2 KB of context and produce a `Could not find oldString` error.** The `oldString`-mismatch failures that recur through the session (msgs 60, 65, 85, 89, 103, 105) are the direct cost of *reconstructing* a long document in the model's head instead of reading it back. The fix — read the file, then edit against the read text — is exactly what the session eventually adopted at msg 90–93 and what produced §16's correction. It is a concrete argument for file-grounded editing over remembered-string editing.
+
+**Reasoning was 62 % of all output tokens but produced the two most important artifacts.** 52,910 reasoning tokens against 32,236 non-reasoning output. And the highest-value outputs were all *thinking* outputs: the compaction summary (msg 43), the A770→`qwen4exp` GDN join (msg 21), the tiering decision (msg 99), the `on-direct` fork detection (§9.1). The visible prose was the cheap part.
+
+---
+
+## 20. Consolidated open questions and what to do next
+
+The session scattered its open questions across §7, §7a, the sanity bands, and individual `us_*.md` files. Consolidated, ranked by how much they block the user's actual goal:
+
+### 20.1 Blocking — the configuration cannot be validated without hardware
+
+| # | question | why blocking |
+|---|---|---|
+| 1 | **What does `qwen4exp` actually do on two B70s?** | Every number in this document is from a third party. The pre-registered band is 35–65 t/s decode, 600–1400 t/s prefill, ≤1.5× degradation at 32 K and ≤3× at 128 K. Nothing has been measured. |
+| 2 | **SYCL vs Vulkan head-to-head on `qwen4exp` specifically** | No public B70 numbers exist for this arch on either backend. #28721 compares them on *other* models. |
+| 3 | **Does the PLE table actually stream, and at what cost?** | The entire >100 GB-into-128 GB premise rests on `--lazy-mode auto` working well. Second-run page-cache-warm timing plus `iostat` is the test. |
+
+### 20.2 Technically open — unanswered anywhere, including upstream
+
+| # | question | origin |
+|---|---|---|
+| 4 | **Does the QSA indexer scan all KV positions, or only the top-k blocks?** | raised in msg 21's reasoning, never pursued, **never written into the deliverable**. Determines whether decode holds up at 262 K. |
+| 5 | Is the MUL_MAT_ID `n_tokens > 8` MMV cutoff actually miscalibrated on Xe2, or is the 2–4× step a real property of the op? | #25356 was measured on gfx1151, not Battlemage |
+| 6 | Does the 4× 3090 Q4_K_XL result of 55 t/s indicate routing/offload overhead that still exists post-#29476? | StyMaar's bandwidth arithmetic says 55 t/s *cannot* be explained by bandwidth alone |
+
+### 20.3 Non-questions — resolved, and safe to stop revisiting
+
+- Strata on Intel: **no.** CUDA/HIP-only, verified.
+- `-sm tensor` on this rig: **no.** Three independent blockers.
+- `--fit` for sizing: **no.** #27595 miscounts the compute buffer.
+- Prebuilt Vulkan binaries: **no.** Pre-#29476 GDN penalty on 36 of 48 layers.
+- Vision on Intel: **no.** #29093 (wrong answers) + #29241 (crash).
+- BF16 MTP head: **no.** Bigger *and* slower.
+- `ngram-mod` speculation on SYCL: **no.** 2.2 GB scratchpad (#28860).
+
+### 20.4 Recommended sequence, in order
+
+1. Build llama.cpp master for **SYCL** and a **Vulkan** A/B. Establish that `#29476` is in the build before measuring anything.
+2. **Validate the premise, not the performance:** confirm the PLE table is lazy and non-resident from the placement log. If it is resident, stop — nothing else matters.
+3. Run the short-context baseline on a **single** B70, no MTP, `-ub 512`, and check it lands in the pre-registered band. Below ~20 t/s, the diagnosis is configuration, not stack (§12.5).
+4. Only then add: layer split → bias via `--tensor-split` → MTP (short context) → the context ladder.
+5. Along the way, `us_29030.md` (lazy-PLE gather, **>2× prefill prototype already exists**) and `us_otgen.md` (router-aware placement) are the two highest-return upstream engagements — and both are *useful before the benchmark*, because the first changes the prefill baseline and the second changes expert residency.
+6. Answer question 4 above with a direct trace. It is cheap, it is unanswered, and it governs whether the 262 K context figure is real.
+
+### 20.5 What this document is, finally
+
+A **plan with evidence behind it**, plus a reasoning trail, plus a compliance audit, plus an economic profile. The analysis is strong and every claim traces to a fetched source. The central performance question — *what this model does on two B70s* — is **unmeasured**, and the honest thing to hand a maintainer is that sentence, not a headline number.
+
+---
+
+## 21. Appendices
+
+### 21.1 Source-thread index
+
+Every Reddit thread the session opened, with where its findings landed. Six were located but **not read** and are recorded as such.
+
+| thread id | title | read | findings in |
+|---|---|---|---|
+| `1w42biu` | MTP released for Qwen3.8-Flash-Next-GGUF | yes | §7, §9.4 |
+| `1w03zdo` | llama.cpp Flash-Next merged-support discussion | yes | §7, §9.4 |
+| `1weobt6` | Strix Halo `qwen4exp` optimisation journey (ilintar) | yes | §9.2 |
+| `1wsodqf` | Any way to run Qwen 3.8 Flash with 7900XTX 24 GB + 64 GB RAM? | yes | §9.3 |
+| `1w4xr6q` | Performance difference on large MoE runs, 64 GB vs 192 GB RAM? | **partial** (bot-walled) | §9.5, §12.1 |
+| `1tuik6o` | Intel Arc Pro B70 llama.cpp benchmarks posted | yes | §7 |
+| `1vulh45` | Intel Arc Pro B70 + vLLM XPU: 52 tok/s on Qwen3.8-27B INT4 | yes | §11 |
+| `1sjlowl` | Best model to use with Arc Pro B70 | yes | §11.4 |
+| `1wp7zyb` | Qwen3.8-Flash-Next on 12GB VRAM — 65 tokens per second | partial | §9.3 |
+| `1vyq2v4` | (linked from `1wsodqf`) Flash-Next command-line thread | no | — |
+| `1w0szzv` | Would Intel Arc B60 or B65 be worth it for Qwen 3.8 27B? | no (B60/B65, not B70) | — |
+| `1wjzg4c` | Qwen3.8-Flash-Next NVFP4 262K ctx on a single DGX Spark | no | — |
+| `1soe0nm` | B70 open-source Linux performance review | no | — |
+
+**The material negative result:** a search for `Flash-Next Intel Arc` returned only 7 threads, none of them a second Intel-Arc + Flash-Next deployment. There was **no public precedent** for the exact target configuration.
+
+### 21.2 Glossary
+
+Model- and project-specific terms, since several (`qwen4exp`, `PLE`, `hc`) are not standard vocabulary.
+
+| term | meaning |
+|---|---|
+| **qwen4exp** | the GGUF architecture string for Qwen3.8-Flash-Next; upstream PR #27742, merged 2026-08-26 |
+| **GDN** | Gated DeltaNet — recurrent linear-attention layer; **36 of 48** layers here. Subject of the 2026-09-29 Vulkan fix #29476 |
+| **QSA** | Qwen Sparse Attention — the **12 of 48** full-attention layers; 24 Q-heads / 2 KV-heads, head_dim 256, partial RoPE 64 |
+| **indexer** | QSA's MQA selector (4 Q-heads / 1 K-head, dim 128) choosing top-2048 tokens from a 512-block budget. §20.2 q.4 asks whether it still scans all KVs |
+| **PLE** | the model's parametrised-lookup / n-gram embedding table: ~320 M rows, 16 heads, ~28.8 GB at 4-bit, randomly row-addressed, layers=[1] |
+| **hc / hyper-connections** | 4-branch gated residual, rank 320; needs special `hc` ggml ops per backend (#29132) |
+| **MTP** | multi-token prediction — a trained extra layer used as a speculative draft; needs #28243 |
+| **lazy mode** | `-lzm/--lazy-mode on\|auto\|off` — mmap-based on-demand tensor paging; the PLE mechanism |
+| **`-ot`** | `--override-tensor`, regex→device placement (`blk\.\d+\.ffn_…_exps…=CPU`) |
+| **VMM** | SYCL virtual memory manager; `pool_vmm` allocations are per-`sycl::context`, the root of #27198 |
+| **MMV** | matrix-multiplication-vector — the non-matrix-core path; the `n_tokens > 8` cutoff in #25356 |
+| **XMX** | Intel matrix-extension units; target of #29245's grouped-MoE GEMM |
+| **PCH / southbridge** | the chipset path a PCIe 4.0 card may traverse; ~8 GB/s at x4 |
+
+### 21.3 Reproduction: how to re-derive this
+
+The session's evidence came from four sources, all cheap to re-run. The one non-obvious trick is Reddit.
+
+**1. GitHub — issue/PR bodies and comments.** Pattern used throughout, no auth, 20–40 s timeouts:
+```bash
+curl -s -m 30 -H "Accept: application/vnd.github+json" \
+  https://api.github.com/repos/ggml-org/llama.cpp/issues/28721
+```
+Search for *closed* issues, forks and PRs the same way. The three bodies that changed conclusions (#28860, #29093, #25612) were fetched this way in one batched `bash` call.
+
+**2. Verify flags in source, not in docs.** This is what caught the fork-only `--lazy-mode on-direct`:
+```bash
+curl -s https://raw.githubusercontent.com/ggml-org/llama.cpp/master/common/arg.cpp \
+  | grep -n "lazy-mode\|lazy_mode\|tensor-read-lazy"
+```
+Same for `-ot`, `-lzm`, `--fit`, `-cmoe`, `-ncmoe`, `-cram`, `--spec-type`, `-ngl`, `--prefetch-rows`.
+
+**3. Hugging Face.** Repo API for tree/metadata, plus `README.md` and `MTP/README.md` as raw files. **The highest-value single step was parsing the GGUF header directly** — reading the first ~4 MB of the GGUF yields arch string, layer count, expert counts, `head_vocab_sizes` (which is where the ~320 M PLE row count comes from), and context length. No need to download 111 GB.
+
+**4. Reddit — the part that needed a trick.** `reddit.com/*.json`, pullpush, Arctic Shift, DuckDuckGo and Bing were all tried and all failed (rate limits, 403s, `site:` filters ignored). What worked was **driving the user's real browser via the Chrome DevTools MCP** and reading the DOM directly, bypassing both the JSON API and React's client rendering. The extraction script used for every thread:
+```js
+(() => {
+  const post = document.querySelector('shreddit-post');
+  const title = post ? post.getAttribute('post-title') : document.title;
+  const body = post ? (post.querySelector('[slot="text-body"]')?.innerText || '')
+                     .replace(/\s+/g,' ').slice(0,2200) : '';
+  const cs = Array.from(document.querySelectorAll('shreddit-comment')).slice(0,40);
+  return JSON.stringify({ title, body, total: cs.length, out: cs.map(c => {
+    const t = (c.querySelector('[slot="comment"]')?.innerText || '').replace(/\s+/g,' ').slice(0,600);
+    return `d${c.getAttribute('depth')||'?'} [${c.getAttribute('author')||'?'}|${c.getAttribute('score')||'?'}] ${t}`;
+  })}, null, 1);
+})()
+```
+Key details that made it work: Reddit renders comments as `<shreddit-comment>` custom elements carrying `depth`/`author`/`score` as **attributes**, the post body lives in `shreddit-post > [slot="text-body"]`, and **always check the returned `title` against the URL you navigated to** — §17.4 shows the session twice believing it was on one thread while the DOM served another, and that check is what would have caught it.
+
+### 21.4 Document map
+
+| § | contents |
+|---|---|
+| 0 | executive summary + the §16 correction |
+| 1 | the user's question and system |
+| 2 | Phase 1 — model ground truth (HF, GGUF header, quants) |
+| 3 | Phase 2 — llama.cpp mainline support state |
+| 4 | Phase 2 cont. — deep dives on the specific problem reports |
+| 5 | the stall, and the user's intervention |
+| 6 | Phase 3 — Reddit via the user's Chrome |
+| 7 | the two documents the agent wrote |
+| 8 | Phase 4 — Reddit deep-dive, post-compaction |
+| 9 | Phase 5 — forks, hyper-parameters, out-performing mainline |
+| 10 | the *intended* shift to measurement (did not happen) |
+| 11 | vLLM XPU on a single B70 — the closest reference |
+| 12 | verification fetches, the finalised recommendation, sanity bands |
+| 13 | the recommended launch configuration (never executed) |
+| 14 | the pivot: what should be changed in llama.cpp |
+| 15 | the ten upstream user stories |
+| 16 | where the session ended + the correction |
+| 17 | the reasoning trail — what drove the decisions |
+| 18 | requirement-compliance audit (all 8 user turns) |
+| 19 | the economics: 79 minutes, $4.71 |
+| 20 | consolidated open questions and next steps |
+| 21 | appendices: thread index, glossary, reproduction, map |
