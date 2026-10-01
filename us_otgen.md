@@ -83,7 +83,7 @@ Tool exists in this workspace with a `--help` matching the emitted-format spec, 
 - Cross-backend adds for the per-part outputs may add latency; the win depends on hot-expert residency.
 
 ## Work Log & Resume Context
-_State: PER-EXPERT M1 DUAL-GPU Q2 PARITY/PERF PASSED ON `us-otgen-expert-ot` 2026-10-01; loader, graph, and Qwen4exp wiring are in place. Q2_K_XL K=2 passes single-GPU `-ngl 2`, dual-GPU `-ngl 48`, single-GPU greedy parity, and dual-GPU greedy parity/perf against the unsplit `-cmoe` path. Pushed to `nilo85` at `6a9e94689`. Next is Q3 capacity validation or routing-aware placement._
+_State: PER-EXPERT M1 VALIDATION DONE ON `us-otgen-expert-ot` 2026-10-01; loader, graph, and Qwen4exp wiring are in place. Q2_K_XL K=2 passes single-GPU, dual-GPU, and greedy parity/perf against the unsplit `-cmoe` path. Q3_K_XL K=8 proves capacity but is too slow for practical use. Pushed to `nilo85` at `6a9e94689`. Next is M2 placement-file plumbing or the trace-to-placement generator._
 
 ### 2026-10-01 — Design + branch strategy (agreed with user)
 - **Goal:** replace static layer-uniform `-ot` placement with workload-calibrated expert placement. Trace per-layer MoE routing over a representative pass, rank expert hotness, solve a VRAM-budget knapsack split proportional to per-device bandwidth, emit an `-ot` pattern file.
@@ -210,4 +210,11 @@ _State: PER-EXPERT M1 DUAL-GPU Q2 PARITY/PERF PASSED ON `us-otgen-expert-ot` 202
 - Common flags: `-ngl 48`, `--split-mode layer`, `--tensor-split 50,50`, `--fit off`, `--ctx-size 4096`, `-n 32`, `-np 1`, `--temp 0`, `-s 1`, `-st`, `--no-display-prompt`, `--jinja`, `--reasoning off`, `-fa on`, `-ctk q4_0`, `-ctv q4_0`, `--load-mode mmap`.
 - Restarted `podman-llama-cpp-qwen3.8-27b.service` after the dual-GPU test window.
 - Conclusion: the M1 per-expert split path is correct for the Q2 greedy prefix and faster than the `-cmoe` CPU-expert baseline in this bounded dual-GPU config.
-- **Next:** validate Q3_K_XL capacity path or move to routing-aware placement / trace-to-placement generator.
+
+### 2026-10-01 - Q3 K=8 capacity passed, perf poor
+- Ran Q3_K_XL with `LLAMA_EXPERT_SPLIT=8`, dual-GPU `-ngl 48`, `--split-mode layer`, `--tensor-split 50,50`, `--fit off`, mmap, `-c 4096`, `-n 32`, greedy seed 1, while the 27B service was stopped.
+- Log: `/tmp/opencode/otgen-expert-split-q3-k8-dual-gpu.log`.
+- Result: exit 0, coherent output, prompt `5.8 t/s`, generation `3.4 t/s`.
+- Restarted `podman-llama-cpp-qwen3.8-27b.service` after the test.
+- Conclusion: uniform K=8 proves the Q3 capacity path can load and run on this rig, but it is not a practical Q3 performance config. The next useful step is routing-aware placement with smaller hot-expert GPU ranges instead of uniform all-GPU-layer K-way splitting.
+- **Next:** move to M2 placement-file plumbing or the out-of-tree trace-to-placement generator.
