@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Generate -ot patterns for synthetic per-expert .partN tensors from routing traces.
+"""DEPRECATED (2026-10-02): its --dump-routing input was removed in M14 (single-mechanism
+MoE heatmap design). Kept as history/fallback for old traces only; use
+--moe-heatmap-fraction + --moe-heatmap / --moe-heatmap-dump instead.
+
+Generate -ot patterns for synthetic per-expert .partN tensors from routing traces.
 
 The trace format is the one emitted by llama-cli --dump-routing:
   il=<layer> <expert>:<count> ...

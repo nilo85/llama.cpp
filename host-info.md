@@ -500,8 +500,19 @@ baselines, use `llama-cli` with bounded `-c` (for example `-c 4096 -n 256`) and
 12. **Production ≠ your build** (upstream `full-intel` vs `master-fresh`).
 13. **`-np`/`--parallel` is not plumbed** through the Nix module. Multi-slot
     experiments need a hand-rolled container command, and the "single-slot"
-    baseline in the docs is really *one active request against a 4-slot server*
-    (`n_slots = 4`, `kv_unified = true`) — not a true `n_slots=1` server.
+     baseline in the docs is really *one active request against a 4-slot server*
+     (`n_slots = 4`, `kv_unified = true`) — not a true `n_slots=1` server.
+ 14. **`/bin/bash` does not exist on this NixOS host** (only `/bin/sh`, a symlink
+     into the nix store; the real bash is `/run/current-system/sw/bin/bash`).
+     A script with a `#!/bin/bash` shebang fails with
+     `bad interpreter: No such file or directory`. Write shebangs as
+     `#!/usr/bin/env bash`, or launch with `bash script.sh` explicitly.
+ 15. **Waiting on long background jobs: use `timeout N tail -f --pid=$PID logfile`.**
+     GNU tail exits on its own when the PID dies, so the wait returns as soon as the
+     job finishes instead of blocking a full timeout (or needing repeated polling).
+     Launch jobs with `nohup ... > log 2>&1 &` (never a foreground `| head` pipe -
+     `head` closes the pipe early and leaves the producer as a zombie), then wait
+     with the tail pattern.
 
 ---
 
