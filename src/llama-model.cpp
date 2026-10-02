@@ -3347,6 +3347,87 @@ ggml_tensor * llama_model_base::create_expert_part(const LLM_TN_IMPL & tn, const
     return create_tensor(*ml, tn, ne, flags);
 }
 
+bool llama_model_base::create_expert_split_tensors(llama_layer & layer, int il,
+        int64_t n_embd_, int64_t n_ff_exp_, int64_t n_expert_) {
+    const char * env_split = getenv("LLAMA_EXPERT_SPLIT");
+    const int n_expert_parts = env_split ? atoi(env_split) : 1;
+
+    if (n_expert_parts <= 1) {
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp_, n_embd_, n_expert_ }, 0);
+        create_tensor_gate_up_exps(layer, il, n_embd_, n_ff_exp_, n_expert_, 0);
+        return false;
+    }
+
+    const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
+    const auto TENSOR_SKIP         = llama_model_loader::TENSOR_SKIP;
+
+    create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,    "weight", il), { n_ff_exp_, n_embd_, n_expert_ }, TENSOR_NOT_REQUIRED | TENSOR_SKIP);
+    create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", il), { n_embd_, n_ff_exp_ * 2, n_expert_ }, TENSOR_NOT_REQUIRED | TENSOR_SKIP);
+    create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS,    "weight", il), { n_embd_, n_ff_exp_, n_expert_ }, TENSOR_NOT_REQUIRED | TENSOR_SKIP);
+    create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,      "weight", il), { n_embd_, n_ff_exp_, n_expert_ }, TENSOR_NOT_REQUIRED | TENSOR_SKIP);
+
+    layer.ffn_expert_part_offsets.clear();
+    for (int p = 0; p < n_expert_parts; ++p) {
+        layer.ffn_expert_part_offsets.push_back((int64_t) p * (n_expert_ / n_expert_parts));
+    }
+
+    const std::string down_name = tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il).str();
+    const std::string gu_name   = tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", il).str();
+    const std::string gate_name = tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", il).str();
+    const std::string up_name   = tn(LLM_TENSOR_FFN_UP_EXPS, "weight", il).str();
+    const ggml_tensor * down_meta = ml->get_tensor_meta(down_name.c_str());
+    const ggml_tensor * gu_meta   = ml->get_tensor_meta(gu_name.c_str());
+    const ggml_tensor * gate_meta = ml->get_tensor_meta(gate_name.c_str());
+    const ggml_tensor * up_meta   = ml->get_tensor_meta(up_name.c_str());
+    const size_t down_stride = down_meta ? down_meta->nb[2] : 0;
+    const size_t gu_stride   = gu_meta   ? gu_meta->nb[2]   : 0;
+    const size_t gate_stride = gate_meta ? gate_meta->nb[2] : 0;
+    const size_t up_stride   = up_meta   ? up_meta->nb[2]   : 0;
+    const bool has_gate_up = gu_meta != nullptr;
+    GGML_ASSERT(down_meta && down_stride > 0);
+    if (!has_gate_up) {
+        GGML_ASSERT(gate_meta && up_meta && gate_stride > 0 && up_stride > 0);
+    }
+
+    layer.ffn_down_exps_parts.clear();
+    layer.ffn_gate_up_exps_parts.clear();
+    layer.ffn_gate_exps_parts.clear();
+    layer.ffn_up_exps_parts.clear();
+
+    for (int p = 0; p < n_expert_parts; ++p) {
+        const int64_t e0 = layer.ffn_expert_part_offsets[p];
+        const int64_t e1 = (p + 1 < n_expert_parts) ? layer.ffn_expert_part_offsets[p + 1] : n_expert_;
+        const int64_t n_e = e1 - e0;
+
+        const std::string down_part_name = format("%s.part%d", down_name.c_str(), p);
+        layer.ffn_down_exps_parts.push_back(create_expert_part(
+                tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp_, n_embd_, n_e }, 0,
+                down_part_name, (size_t) e0 * down_stride, get_expert_split_buft(il, p, down_part_name)));
+
+        if (has_gate_up) {
+            const std::string gu_part_name = format("%s.part%d", gu_name.c_str(), p);
+            layer.ffn_gate_up_exps_parts.push_back(create_expert_part(
+                    tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", il), { n_embd_, n_ff_exp_ * 2, n_e }, 0,
+                    gu_part_name, (size_t) e0 * gu_stride, get_expert_split_buft(il, p, gu_part_name)));
+        } else {
+            const std::string gate_part_name = format("%s.part%d", gate_name.c_str(), p);
+            const std::string up_part_name   = format("%s.part%d", up_name.c_str(), p);
+            layer.ffn_gate_exps_parts.push_back(create_expert_part(
+                    tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", il), { n_embd_, n_ff_exp_, n_e }, 0,
+                    gate_part_name, (size_t) e0 * gate_stride, get_expert_split_buft(il, p, gate_part_name)));
+            layer.ffn_up_exps_parts.push_back(create_expert_part(
+                    tn(LLM_TENSOR_FFN_UP_EXPS, "weight", il), { n_embd_, n_ff_exp_, n_e }, 0,
+                    up_part_name, (size_t) e0 * up_stride, get_expert_split_buft(il, p, up_part_name)));
+        }
+    }
+
+    layer.ffn_down_exps    = nullptr;
+    layer.ffn_gate_up_exps = nullptr;
+    layer.ffn_gate_exps    = nullptr;
+    layer.ffn_up_exps      = nullptr;
+    return true;
+}
+
 void llama_model_base::load_moe_heatmap(int n_expert_parts) {
     std::ifstream file(params.moe_heatmap);
     if (!file) {

@@ -837,6 +837,13 @@ struct llama_model_base : public llama_model {
     ggml_tensor * create_expert_part(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
             const std::string & part_name, size_t part_offs, ggml_backend_buffer_type_t buft);
 
+    // split the 3D expert tensors into LLAMA_EXPERT_SPLIT contiguous parts (placed via get_expert_split_buft),
+    // or create the full tensors when the split is not set. Returns true if the experts were split (the full
+    // tensors are null, use the *_parts vectors in the graph); false if full tensors were created. The caller
+    // creates ffn_gate_inp and any shared-expert tensors separately.
+    bool create_expert_split_tensors(llama_layer & layer, int il,
+            int64_t n_embd_, int64_t n_ff_exp_, int64_t n_expert_);
+
     // pick the buffer type for expert part `part_idx` of layer `il` (part 0 = layer device, part 1+ = another GPU or CPU)
     // an explicit tensor buft override matching `part_name` wins over the default split rule
     ggml_backend_buffer_type_t get_expert_split_buft(int il, int part_idx, const std::string & part_name) const;

@@ -118,15 +118,8 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
             layer.ffn_post_norm_1 = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM_1, "weight", i), {n_embd}, 0);
             layer.ffn_post_norm_2 = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM_2, "weight", i), {n_embd}, 0);
 
-            // MoE FFN
-            layer.ffn_gate_up_exps  = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS,  "weight", i), {n_embd, n_ff_exp * 2, n_expert}, TENSOR_NOT_REQUIRED);
-
-            if (layer.ffn_gate_up_exps == nullptr) {
-                layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
-                layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
-            }
-
-            layer.ffn_down_exps     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,     "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
+            // MoE FFN (split into parts if LLAMA_EXPERT_SPLIT>1, else full tensors)
+            create_expert_split_tensors(layer, i, n_embd, n_ff_exp, n_expert);
 
             // per-expert scale will be loaded as down_exps_s at the end of the current switch case
         }
@@ -334,7 +327,17 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                     model.layers[il].ffn_gate_up_exps,
                     model.layers[il].ffn_up_exps_s,
                     model.layers[il].ffn_gate_exps_s,
-                    model.layers[il].ffn_down_exps_s);
+                    model.layers[il].ffn_down_exps_s,
+                    nullptr,
+                    model.layers[il].ffn_gate_up_exps_parts.empty() ? nullptr : &model.layers[il].ffn_gate_up_exps_parts,
+                    model.layers[il].ffn_gate_exps_parts.empty()    ? nullptr : &model.layers[il].ffn_gate_exps_parts,
+                    model.layers[il].ffn_up_exps_parts.empty()      ? nullptr : &model.layers[il].ffn_up_exps_parts,
+                    model.layers[il].ffn_down_exps_parts.empty()    ? nullptr : &model.layers[il].ffn_down_exps_parts,
+                    model.layers[il].ffn_gate_up_exps_s_parts.empty() ? nullptr : &model.layers[il].ffn_gate_up_exps_s_parts,
+                    model.layers[il].ffn_gate_exps_s_parts.empty()    ? nullptr : &model.layers[il].ffn_gate_exps_s_parts,
+                    model.layers[il].ffn_up_exps_s_parts.empty()      ? nullptr : &model.layers[il].ffn_up_exps_s_parts,
+                    model.layers[il].ffn_down_exps_s_parts.empty()    ? nullptr : &model.layers[il].ffn_down_exps_s_parts,
+                    model.layers[il].ffn_expert_part_offsets.empty()  ? nullptr : &model.layers[il].ffn_expert_part_offsets);
             cur_moe = build_norm(cur_moe,
                     model.layers[il].ffn_post_norm_2, nullptr,
                     LLM_NORM_RMS, il);
