@@ -1980,7 +1980,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
      llm_ffn_op_type   type_op,
                 bool   norm_w,
                float   w_scale,
-        llama_expert_gating_func_type gating_op,
+         llama_expert_gating_func_type gating_op,
                  int   il,
          ggml_tensor * probs_in,
          ggml_tensor * gate_up_exps,
