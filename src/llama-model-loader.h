@@ -73,6 +73,7 @@ struct llama_model_loader {
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
     static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
+    static const int TENSOR_EXPERT          = 1 << 6; // MoE expert tensor; when the split is armed the whole tensor is never created, only byte-sliced parts
 
     int n_kv      = 0;
     int n_tensors = 0;
@@ -131,13 +132,19 @@ struct llama_model_loader {
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 
-    // when set, the next create_tensor() call creates a synthetic byte-slice of the named GGUF tensor
-    struct expert_part_spec {
-        std::string name;
-        size_t offs = 0;
-        ggml_backend_buffer_type_t buft = nullptr;
-        bool active = false;
-    } part_spec;
+    // MoE expert split: armed by llama_model_base::setup_moe_split() before tensor creation.
+    // When enabled, TENSOR_EXPERT tensors are never created whole; the loader byte-slices them
+    // into k parts, placing hot parts on the owning layer's local buffer and cold parts on CPU.
+    struct moe_split {
+        bool enabled = false;
+        int  k = 0;
+        std::vector<std::vector<char>> hot_parts; // per-layer, per-part hot flag
+        std::vector<ggml_backend_buffer_type_t> local_buft; // per-layer local buffer (hot placement)
+    } moe_split;
+
+    // byte-sliced expert parts created by the TENSOR_EXPERT branch, keyed by the original tensor name;
+    // drained by llama_model_base into the layer part vectors after load_arch_tensors() and the scale pass
+    std::map<std::string, std::vector<ggml_tensor *>> expert_parts;
 
     gguf_context_ptr metadata_ptr;
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
@@ -253,6 +260,9 @@ struct llama_model_loader {
     void reserve_part_tensors(int n) {
         n_part_tensors += n;
     }
+
+    // placement for expert part `part_idx` of layer `il`: a tensor override wins, cold parts go to CPU, hot parts to the layer-local buffer
+    ggml_backend_buffer_type_t expert_split_buft(int il, int part_idx, const std::string & part_name) const;
 
     void done_getting_tensors(bool partial = false) const;
 

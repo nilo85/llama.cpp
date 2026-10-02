@@ -5,8 +5,6 @@
 
 #include <algorithm>
 #include <cinttypes>
-#include <cstdlib>
-#include <string>
 
 // [TAG_QWEN4_REIMPLEMENT]
 // TODO: this graph implementation is pending complete reimplementation - do not use it as a reference
@@ -253,8 +251,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
 
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, 0);
-
-        create_expert_split_tensors(layer, il, n_embd, n_ff_exp, n_expert);
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, TENSOR_EXPERT);
+        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, TENSOR_EXPERT);
 
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, 0);
         layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, 0);
@@ -996,32 +994,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
-    const auto & l = model.layers[il];
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
-            l.ffn_gate_inp,
-            l.ffn_up_exps,
-            l.ffn_gate_exps,
-            l.ffn_down_exps,
+            model.layers[il].ffn_gate_inp,
+            model.layers[il].ffn_up_exps,
+            model.layers[il].ffn_gate_exps,
+            model.layers[il].ffn_down_exps,
             nullptr,
             n_expert, n_expert_used,
             LLM_FFN_SILU, true,
             hparams.expert_weights_scale,
             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, l.ffn_gate_up_exps,
-            l.ffn_up_exps_s,
-            l.ffn_gate_exps_s,
-            l.ffn_down_exps_s,
+            nullptr, model.layers[il].ffn_gate_up_exps,
+            model.layers[il].ffn_up_exps_s,
+            model.layers[il].ffn_gate_exps_s,
+            model.layers[il].ffn_down_exps_s,
             nullptr,
-            l.ffn_gate_up_exps_parts.empty() ? nullptr : &l.ffn_gate_up_exps_parts,
-            l.ffn_gate_exps_parts.empty()    ? nullptr : &l.ffn_gate_exps_parts,
-            l.ffn_up_exps_parts.empty()      ? nullptr : &l.ffn_up_exps_parts,
-            l.ffn_down_exps_parts.empty()    ? nullptr : &l.ffn_down_exps_parts,
-            l.ffn_gate_up_exps_s_parts.empty() ? nullptr : &l.ffn_gate_up_exps_s_parts,
-            l.ffn_gate_exps_s_parts.empty()    ? nullptr : &l.ffn_gate_exps_s_parts,
-            l.ffn_up_exps_s_parts.empty()      ? nullptr : &l.ffn_up_exps_s_parts,
-            l.ffn_down_exps_s_parts.empty()    ? nullptr : &l.ffn_down_exps_s_parts,
-            l.ffn_expert_part_offsets.empty()  ? nullptr : &l.ffn_expert_part_offsets);
+            &model.layers[il]);
     cb(moe_out, "ffn_moe_out", il);
 
     // shared experts, as in the Qwen3Next reference

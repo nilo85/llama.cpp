@@ -1974,16 +1974,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in,
-    const std::vector<ggml_tensor *> * gate_up_exps_parts,
-    const std::vector<ggml_tensor *> * gate_exps_parts,
-    const std::vector<ggml_tensor *> * up_exps_parts,
-    const std::vector<ggml_tensor *> * down_exps_parts,
-    const std::vector<ggml_tensor *> * gate_up_exps_s_parts,
-    const std::vector<ggml_tensor *> * gate_exps_s_parts,
-    const std::vector<ggml_tensor *> * up_exps_s_parts,
-    const std::vector<ggml_tensor *> * down_exps_s_parts,
-    const std::vector<int64_t> * expert_part_offsets) const {
+          ggml_tensor * selected_experts_in,
+     const llama_layer * layer) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -2005,15 +1997,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         gate_exps_s,
         down_exps_s,
         selected_experts_in,
-        gate_up_exps_parts,
-        gate_exps_parts,
-        up_exps_parts,
-        down_exps_parts,
-        gate_up_exps_s_parts,
-        gate_exps_s_parts,
-        up_exps_s_parts,
-        down_exps_s_parts,
-        expert_part_offsets
+        layer
     );
 }
 
@@ -2041,16 +2025,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in,
-    const std::vector<ggml_tensor *> * gate_up_exps_parts,
-    const std::vector<ggml_tensor *> * gate_exps_parts,
-    const std::vector<ggml_tensor *> * up_exps_parts,
-    const std::vector<ggml_tensor *> * down_exps_parts,
-    const std::vector<ggml_tensor *> * gate_up_exps_s_parts,
-    const std::vector<ggml_tensor *> * gate_exps_s_parts,
-    const std::vector<ggml_tensor *> * up_exps_s_parts,
-    const std::vector<ggml_tensor *> * down_exps_s_parts,
-    const std::vector<int64_t> * expert_part_offsets) const {
+          ggml_tensor * selected_experts_in,
+     const llama_layer * layer) const {
+    // source the expert parts from the layer when provided (B+); a part vector is only used when
+    // populated, so fused-gate_up and separate-gate+up layers each expose only the parts they have
+    const std::vector<ggml_tensor *> * gate_up_exps_parts   = (layer && !layer->ffn_gate_up_exps_parts.empty())   ? &layer->ffn_gate_up_exps_parts   : nullptr;
+    const std::vector<ggml_tensor *> * gate_exps_parts      = (layer && !layer->ffn_gate_exps_parts.empty())      ? &layer->ffn_gate_exps_parts      : nullptr;
+    const std::vector<ggml_tensor *> * up_exps_parts        = (layer && !layer->ffn_up_exps_parts.empty())        ? &layer->ffn_up_exps_parts        : nullptr;
+    const std::vector<ggml_tensor *> * down_exps_parts      = (layer && !layer->ffn_down_exps_parts.empty())      ? &layer->ffn_down_exps_parts      : nullptr;
+    const std::vector<ggml_tensor *> * gate_up_exps_s_parts = (layer && !layer->ffn_gate_up_exps_s_parts.empty()) ? &layer->ffn_gate_up_exps_s_parts : nullptr;
+    const std::vector<ggml_tensor *> * gate_exps_s_parts    = (layer && !layer->ffn_gate_exps_s_parts.empty())    ? &layer->ffn_gate_exps_s_parts    : nullptr;
+    const std::vector<ggml_tensor *> * up_exps_s_parts      = (layer && !layer->ffn_up_exps_s_parts.empty())      ? &layer->ffn_up_exps_s_parts      : nullptr;
+    const std::vector<ggml_tensor *> * down_exps_s_parts    = (layer && !layer->ffn_down_exps_s_parts.empty())    ? &layer->ffn_down_exps_s_parts    : nullptr;
+    const std::vector<int64_t> * expert_part_offsets        = (layer && !layer->ffn_expert_part_offsets.empty())  ? &layer->ffn_expert_part_offsets  : nullptr;
+
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN

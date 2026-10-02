@@ -923,6 +923,34 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(
     return cur;
 }
 
+ggml_backend_buffer_type_t llama_model_loader::expert_split_buft(int il, int part_idx, const std::string & part_name) const {
+    if (tensor_buft_overrides) {
+        for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
+            std::regex pattern(overrides->pattern);
+            if (std::regex_search(part_name, pattern)) {
+                if (overrides->buft == ggml_backend_cpu_buffer_type()) {
+                    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                    GGML_ASSERT(cpu_dev != nullptr);
+                    return ggml_backend_dev_buffer_type(cpu_dev);
+                }
+                return overrides->buft;
+            }
+        }
+    }
+
+    // cold parts go to the CPU; hot parts (and anything unranked) stay on the layer's local buffer
+    if (!moe_split.hot_parts.empty() && il >= 0 && il < (int) moe_split.hot_parts.size()
+            && part_idx >= 0 && part_idx < (int) moe_split.hot_parts[il].size()
+            && !moe_split.hot_parts[il][part_idx]) {
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        GGML_ASSERT(cpu_dev != nullptr);
+        return ggml_backend_dev_buffer_type(cpu_dev);
+    }
+
+    GGML_ASSERT(il >= 0 && il < (int) moe_split.local_buft.size() && moe_split.local_buft[il] != nullptr);
+    return moe_split.local_buft[il];
+}
+
 // checks if the weight tensor can be used with the specified buffer type and device
 static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev) {
     GGML_ASSERT(w != nullptr);
@@ -1129,7 +1157,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             max_n_tensors += 1;                   // duplicated output tensor
             max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
             max_n_tensors += n_part_tensors;
-            if (files.empty() || !part_spec.name.empty() || n_part_tensors > 0) {
+            if (files.empty() || moe_split.enabled || n_part_tensors > 0) {
                 max_n_tensors += hparams.n_layer()*256; // this should be well above what any model actually uses
             }
             const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
@@ -1290,65 +1318,6 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return buft;
     };
 
-    if (part_spec.active) {
-        part_spec.active = false;
-
-        if (!files.empty()) {
-            ggml_type type = GGML_TYPE_F32;
-            const llama_tensor_weight * orig_w = get_weight(tn.str().c_str());
-            if (orig_w && orig_w->tensor) {
-                type = orig_w->tensor->type;
-            } else {
-                const int64_t tid = gguf_find_tensor(metadata, tn.str().c_str());
-                if (tid != -1) {
-                    type = gguf_get_tensor_type(metadata, tid);
-                }
-            }
-
-            ggml_tensor t_meta;
-            memset(&t_meta, 0, sizeof(ggml_tensor));
-            t_meta.type = type;
-            for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
-                t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
-                GGML_ASSERT(t_meta.ne[dim] >= 1);
-                if (dim == 0) {
-                    t_meta.nb[dim] = ggml_type_size(type);
-                } else if (dim == 1) {
-                    t_meta.nb[dim] = ggml_row_size(type, t_meta.ne[dim-1]);
-                } else {
-                    t_meta.nb[dim] = t_meta.nb[dim-1]*t_meta.ne[dim-1];
-                }
-                GGML_ASSERT(t_meta.nb[dim] >= 1);
-            }
-            ggml_set_name(&t_meta, part_spec.name.c_str());
-
-            ggml_backend_buffer_type_t buft = part_spec.buft;
-            if (!buft) {
-                buft = buft_for_tensor(&t_meta);
-            }
-            if (!buft) {
-                return nullptr;
-            }
-
-            ggml_context * ctx = ctx_for_buft(buft);
-            ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
-            ggml_set_name(ret, part_spec.name.c_str());
-
-            if (orig_w) {
-                llama_tensor_weight w(orig_w->idx, orig_w->offs + part_spec.offs, ret);
-                weights_map.emplace(part_spec.name, w);
-            }
-
-            size_data += ggml_nbytes(&t_meta);
-            n_part_tensors++;
-
-            LLAMA_LOG_DEBUG("expert part: %s type=%s buft=%s bytes=%zu offs=%zu\n",
-                    part_spec.name.c_str(), ggml_type_name(type), ggml_backend_buft_name(buft), ggml_nbytes(&t_meta), part_spec.offs);
-
-            return ret;
-        }
-    }
-
     if (files.empty()) {
         if (flags & TENSOR_SKIP_IF_VIRTUAL) {
             return nullptr;
@@ -1419,6 +1388,84 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     GGML_ASSERT(ggml_nbytes(&t_meta) == ggml_nbytes(cur));
+
+    // MoE expert tensor with the split armed: the whole tensor is never materialized.
+    // Skip it (same accounting as the skip path) and create k byte-slice parts instead,
+    // stashing them for llama_model_base to drain into the layer part vectors.
+    if ((flags & TENSOR_EXPERT) && moe_split.enabled) {
+        const size_t nbytes = ggml_nbytes(&t_meta);
+        size_data -= nbytes;
+        n_created++;
+
+        const int il = tn.bid;
+
+        // the expert dim is the last logical dim; the byte stride of one expert is its nb
+        int expert_dim = 0;
+        for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
+            if (t_meta.ne[dim] > 1) {
+                expert_dim = dim;
+            }
+        }
+        const int64_t n_expert = t_meta.ne[expert_dim];
+        const size_t stride = t_meta.nb[expert_dim];
+
+        auto create_part = [&](int p, int64_t n_e, int64_t e0) -> ggml_tensor * {
+            std::vector<int64_t> part_ne(GGML_MAX_DIMS, 1);
+            for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
+                part_ne[dim] = t_meta.ne[dim];
+            }
+            part_ne[expert_dim] = n_e;
+
+            ggml_tensor p_meta;
+            memset(&p_meta, 0, sizeof(ggml_tensor));
+            p_meta.type = t_meta.type;
+            for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
+                p_meta.ne[dim] = part_ne[dim];
+                GGML_ASSERT(p_meta.ne[dim] >= 1);
+                if (dim == 0) {
+                    p_meta.nb[dim] = ggml_type_size(p_meta.type);
+                } else if (dim == 1) {
+                    p_meta.nb[dim] = ggml_row_size(p_meta.type, p_meta.ne[dim-1]);
+                } else {
+                    p_meta.nb[dim] = p_meta.nb[dim-1]*p_meta.ne[dim-1];
+                }
+                GGML_ASSERT(p_meta.nb[dim] >= 1);
+            }
+
+            const std::string part_name = format("%s.part%d", tn.str().c_str(), p);
+            ggml_set_name(&p_meta, part_name.c_str());
+
+            const size_t part_offs = (size_t) e0 * stride;
+            ggml_backend_buffer_type_t part_buft = expert_split_buft(il, p, part_name);
+
+            ggml_context * ctx = ctx_for_buft(part_buft);
+            ggml_tensor * ret = ggml_dup_tensor(ctx, &p_meta);
+            ggml_set_name(ret, part_name.c_str());
+
+            const llama_tensor_weight * orig_w = get_weight(tn.str().c_str());
+            if (orig_w) {
+                llama_tensor_weight w(orig_w->idx, orig_w->offs + part_offs, ret);
+                weights_map.emplace(part_name, w);
+            }
+
+            size_data += ggml_nbytes(&p_meta);
+            n_part_tensors++;
+
+            LLAMA_LOG_DEBUG("expert part: %s type=%s buft=%s bytes=%zu offs=%zu\n",
+                    part_name.c_str(), ggml_type_name(p_meta.type), ggml_backend_buft_name(part_buft), ggml_nbytes(&p_meta), part_offs);
+
+            return ret;
+        };
+
+        const int k = moe_split.k;
+        for (int p = 0; p < k; ++p) {
+            const int64_t e0 = (int64_t) p * (n_expert / k);
+            const int64_t e1 = (p + 1 < k) ? (int64_t) (p + 1) * (n_expert / k) : n_expert;
+            expert_parts[tn.str()].push_back(create_part(p, e1 - e0, e0));
+        }
+
+        return nullptr;
+    }
 
     ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
     if (buft == nullptr) {
