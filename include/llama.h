@@ -346,8 +346,10 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
-        // optional: MoE heatmap file driving expert part placement (hot parts -> local GPU, cold -> CPU)
+        // optional: MoE heatmap file refining expert part placement (hot parts -> local GPU, cold -> CPU);
+        // only has an effect when moe_heatmap_fraction is set
         const char * moe_heatmap;
+        // enables the per-expert MoE split; fraction of each layer's routed experts kept on the local GPU (-1 = disabled)
         float        moe_heatmap_fraction;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
@@ -395,9 +397,6 @@ extern "C" {
 
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
-
-        // optional: dump per-layer MoE expert routing to FILE (calibration trace, one line per MoE layer per step)
-        const char * dump_routing;
 
         // optional: collect MoE expert usage and dump the full heatmap to FILE on exit (opt-in, per-step readback cost)
         const char * moe_heatmap_dump;

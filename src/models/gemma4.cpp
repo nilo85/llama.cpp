@@ -118,7 +118,7 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
             layer.ffn_post_norm_1 = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM_1, "weight", i), {n_embd}, 0);
             layer.ffn_post_norm_2 = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM_2, "weight", i), {n_embd}, 0);
 
-            // MoE FFN (split into parts if LLAMA_EXPERT_SPLIT>1, else full tensors)
+            // MoE FFN (split into parts if the MoE split is enabled, else full tensors)
             create_expert_split_tensors(layer, i, n_embd, n_ff_exp, n_expert);
 
             // per-expert scale will be loaded as down_exps_s at the end of the current switch case

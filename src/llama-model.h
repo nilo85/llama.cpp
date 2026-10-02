@@ -837,24 +837,28 @@ struct llama_model_base : public llama_model {
     ggml_tensor * create_expert_part(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
             const std::string & part_name, size_t part_offs, ggml_backend_buffer_type_t buft);
 
-    // split the 3D expert tensors into LLAMA_EXPERT_SPLIT contiguous parts (placed via get_expert_split_buft),
-    // or create the full tensors when the split is not set. Returns true if the experts were split (the full
-    // tensors are null, use the *_parts vectors in the graph); false if full tensors were created. The caller
-    // creates ffn_gate_inp and any shared-expert tensors separately.
+    // split the 3D expert tensors into K contiguous parts (K derived from params.moe_heatmap_fraction,
+    // placed via get_expert_split_buft), or create the full tensors when the split is disabled.
+    // Returns true if the experts were split (the full tensors are null, use the *_parts vectors in the
+    // graph); false if full tensors were created. The caller creates ffn_gate_inp and any shared-expert
+    // tensors separately.
     bool create_expert_split_tensors(llama_layer & layer, int il,
             int64_t n_embd_, int64_t n_ff_exp_, int64_t n_expert_);
 
-    // pick the buffer type for expert part `part_idx` of layer `il` (part 0 = layer device, part 1+ = another GPU or CPU)
+    // pick the buffer type for expert part `part_idx` of layer `il` (hot parts -> local GPU, cold -> CPU)
     // an explicit tensor buft override matching `part_name` wins over the default split rule
     ggml_backend_buffer_type_t get_expert_split_buft(int il, int part_idx, const std::string & part_name) const;
 
-    // MoE heatmap placement (params.moe_heatmap): per-layer expert scores and the per-part hot/cold decision
+    // MoE expert split (params.moe_heatmap_fraction >= 0): K parts per layer, derived from the fraction
+    int moe_split_k = 0; // 0 = split disabled
+
+    // per-layer expert ordering (file order, or identity seed) and the per-part hot/cold decision
     // used by get_expert_split_buft (hot -> local GPU, cold -> CPU); empty = disabled
-    std::vector<std::vector<double>> moe_heatmap;
+    std::vector<std::vector<int32_t>> moe_expert_order;
     std::vector<std::vector<char>>    moe_hot_parts;
 
-    // parse the MoE heatmap file and precompute the hot parts per layer (called from load_tensors)
-    void load_moe_heatmap(int n_expert_parts);
+    // derive K from the fraction, load the per-layer order (file, or seed) and precompute the hot parts
+    void setup_moe_split(llama_model_loader & ml);
 
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,

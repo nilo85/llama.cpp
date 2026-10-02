@@ -143,7 +143,6 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
-    cparams.dump_routing      = params.dump_routing ? params.dump_routing : "";
     cparams.moe_heatmap_dump  = params.moe_heatmap_dump ? params.moe_heatmap_dump : "";
 
     cparams.ctx_other = nullptr;
@@ -1470,7 +1469,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!cparams.dump_routing.empty() || !cparams.moe_heatmap_dump.empty()) {
+        if (!cparams.moe_heatmap_dump.empty()) {
             for (const auto & cap : routing_captures) {
                 if (cap.second && ggml_graph_size(gf) > ggml_graph_n_nodes(gf)) {
                     // keep the routing tensor alive until after the graph compute so the trace reads valid data
@@ -1505,7 +1504,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    routing_trace_flush();
+    moe_heatmap_flush();
 
     ret = GGML_STATUS_SUCCESS;
 
@@ -2666,34 +2665,19 @@ llm_graph_cb llama_context::graph_get_cb() const {
             }
         }
 
-        // capture the MoE routing for the calibration trace / heatmap dump (re-captured on every graph rebuild)
-        if ((!cparams.dump_routing.empty() || !cparams.moe_heatmap_dump.empty()) && name && strcmp(name, "ffn_moe_topk") == 0) {
+        // capture the MoE routing for the heatmap dump (re-captured on every graph rebuild)
+        if (!cparams.moe_heatmap_dump.empty() && name && strcmp(name, "ffn_moe_topk") == 0) {
             routing_captures.emplace_back(il, cur);
         }
     };
 }
 
-void llama_context::routing_trace_flush() {
-    if (routing_captures.empty()) {
-        return;
-    }
-    bool trace = !cparams.dump_routing.empty();
-    const bool dump = !cparams.moe_heatmap_dump.empty();
-    if (!trace && !dump) {
+void llama_context::moe_heatmap_flush() {
+    if (routing_captures.empty() || cparams.moe_heatmap_dump.empty()) {
         return;
     }
 
-    if (trace && !routing_trace.is_open()) {
-        routing_trace.open(cparams.dump_routing, std::ios::app);
-        if (!routing_trace.is_open()) {
-            LLAMA_LOG_ERROR("%s: failed to open routing trace file '%s'\n", __func__, cparams.dump_routing.c_str());
-            trace = false;
-        } else {
-            routing_trace << "# il=<layer> <expert>:<count> ... (one line per MoE layer per step)\n";
-        }
-    }
-
-    if (dump && moe_heatmap_totals.empty()) {
+    if (moe_heatmap_totals.empty()) {
         moe_heatmap_totals.resize(model.hparams.n_layer_all);
     }
 
@@ -2722,22 +2706,11 @@ void llama_context::routing_trace_flush() {
             }
         }
 
-        if (trace) {
-            routing_trace << "il=" << cap.first;
-            for (const auto & kv : counts) {
-                routing_trace << " " << kv.first << ":" << kv.second;
-            }
-            routing_trace << "\n";
-        }
-
-        if (dump && cap.first >= 0 && cap.first < (int) moe_heatmap_totals.size()) {
+        if (cap.first >= 0 && cap.first < (int) moe_heatmap_totals.size()) {
             for (const auto & kv : counts) {
                 moe_heatmap_totals[cap.first][kv.first] += kv.second;
             }
         }
-    }
-    if (trace) {
-        routing_trace.flush();
     }
 }
 
@@ -3852,7 +3825,6 @@ llama_context_params llama_context_default_params() {
         /*.defrag_thold                =*/ -1.0f,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
-        /*.dump_routing                =*/ nullptr,
         /*.moe_heatmap_dump            =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,

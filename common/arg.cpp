@@ -2754,15 +2754,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_OVERRIDE_TENSOR"));
     add_opt(common_arg(
-        {"--dump-routing"}, "<file>",
-        "dump per-layer MoE expert routing to FILE (calibration trace for -ot generation)",
-        [](common_params & params, const std::string & value) {
-            params.dump_routing = value;
-        }
-    ).set_env("LLAMA_ARG_DUMP_ROUTING"));
-    add_opt(common_arg(
         {"--moe-heatmap"}, "<file>",
-        "load an MoE heatmap (il=<layer> <expert>:<score>) and place hot expert parts on the local GPU, cold on CPU (requires LLAMA_EXPERT_SPLIT)",
+        "load an MoE heatmap (il=<layer> <expert>:<score>) to order expert parts hottest-first; needs --moe-heatmap-fraction to enable the split",
         [](common_params & params, const std::string & value) {
             params.moe_heatmap = value;
         }
@@ -2776,7 +2769,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_HEATMAP_DUMP"));
     add_opt(common_arg(
         {"--moe-heatmap-fraction"}, "F",
-        "fraction of each layer's expert parts placed on the local GPU when using --moe-heatmap (default: 0.5)",
+        "enables the per-expert MoE split; fraction of each layer's routed experts kept on the local GPU, rest on CPU (default: disabled)",
         [](common_params & params, const std::string & value) {
             const float f = std::stof(value);
             if (f < 0.0f || f > 1.0f) {

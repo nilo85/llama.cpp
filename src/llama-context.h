@@ -12,7 +12,6 @@
 #include "ggml-opt.h"
 
 #include <array>
-#include <fstream>
 #include <map>
 #include <utility>
 #include <vector>
@@ -273,8 +272,8 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
-    // read back the captured ffn_moe_topk tensors and append the per-layer expert counts to the trace file
-    void routing_trace_flush();
+    // read back the captured ffn_moe_topk tensors and accumulate the per-layer expert counts for the heatmap dump
+    void moe_heatmap_flush();
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -295,9 +294,8 @@ private:
 
     llama_cparams cparams;
 
-    // MoE routing trace (cparams.dump_routing): ffn_moe_topk nodes captured at graph build,
+    // MoE heatmap dump (cparams.moe_heatmap_dump): ffn_moe_topk nodes captured at graph build,
     // read back after each compute; mutable because graph_get_cb() is const
-    std::ofstream routing_trace;
     mutable std::vector<std::pair<int, ggml_tensor *>> routing_captures;
 
     // MoE heatmap dump (cparams.moe_heatmap_dump): per-layer expert usage accumulated over the run, dumped on exit

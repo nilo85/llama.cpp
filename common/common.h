@@ -493,11 +493,9 @@ struct common_params {
     ggml_backend_sched_eval_callback cb_eval = nullptr;
     void * cb_eval_user_data                 = nullptr;
 
-    std::string dump_routing; // dump per-layer MoE expert routing to this file (calibration trace)
-
     std::string moe_heatmap; // MoE heatmap file driving expert part placement (hot -> local GPU, cold -> CPU)
     std::string moe_heatmap_dump; // dump the full MoE usage heatmap to this file on exit (opt-in)
-    float moe_heatmap_fraction = 0.5f; // fraction of each layer's expert parts placed on the local GPU
+    float moe_heatmap_fraction = -1.0f; // enables the per-expert MoE split; fraction of each layer's routed experts kept on the local GPU (-1 = disabled)
 
     ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
 
