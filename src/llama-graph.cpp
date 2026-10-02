@@ -1987,8 +1987,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-          ggml_tensor * selected_experts_in,
-     const llama_layer * layer) const {
+         ggml_tensor * selected_experts_in,
+   const llama_layer * layer) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -2038,8 +2038,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-          ggml_tensor * selected_experts_in,
-     const llama_layer * layer) const {
+         ggml_tensor * selected_experts_in,
+   const llama_layer * layer) const {
     // source the expert parts from the layer when provided (B+); a part vector is only used when
     // populated, so fused-gate_up and separate-gate+up layers each expose only the parts they have
     const std::vector<ggml_tensor *> * gate_up_exps_parts   = (layer && !layer->ffn_gate_up_exps_parts.empty())   ? &layer->ffn_gate_up_exps_parts   : nullptr;
