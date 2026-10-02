@@ -848,7 +848,7 @@ struct llama_model_base : public llama_model {
     // convenience overload of create_tensor that doesn't require llama_model_loader
     ggml_tensor * create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
-    // MoE expert split (params.moe_heatmap_fraction >= 0): K parts per layer, derived from the fraction
+    // MoE expert split (params.moe_expert_split >= 0): K parts per layer, derived from the fraction
     int moe_split_k = 0; // 0 = split disabled
 
     // per-layer expert ordering (file order, or identity seed) and the per-part hot/cold decision

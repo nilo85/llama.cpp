@@ -143,7 +143,7 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
-    cparams.moe_heatmap_dump  = params.moe_heatmap_dump ? params.moe_heatmap_dump : "";
+    cparams.moe_expert_profile_dump  = params.moe_expert_profile_dump ? params.moe_expert_profile_dump : "";
 
     cparams.ctx_other = nullptr;
 
@@ -488,25 +488,25 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
-    if (!cparams.moe_heatmap_dump.empty() && !moe_heatmap_totals.empty()) {
-        std::ofstream file(cparams.moe_heatmap_dump.c_str());
+    if (!cparams.moe_expert_profile_dump.empty() && !moe_expert_profile_totals.empty()) {
+        std::ofstream file(cparams.moe_expert_profile_dump.c_str());
         if (!file) {
-            LLAMA_LOG_ERROR("%s: failed to open MoE heatmap dump file '%s'\n", __func__, cparams.moe_heatmap_dump.c_str());
+            LLAMA_LOG_ERROR("%s: failed to open MoE expert profile dump file '%s'\n", __func__, cparams.moe_expert_profile_dump.c_str());
         } else {
             file << std::fixed << std::setprecision(6);
-            file << "# MoE heatmap: il=<layer> <expert>:<score> ... (score = fraction of the layer's routing, sums to 1 per layer; sorted desc; placement-independent)\n";
-            for (size_t il = 0; il < moe_heatmap_totals.size(); ++il) {
-                if (moe_heatmap_totals[il].empty()) {
+            file << "# MoE expert profile: il=<layer> <expert>:<score> ... (score = fraction of the layer's routing, sums to 1 per layer; sorted desc; placement-independent)\n";
+            for (size_t il = 0; il < moe_expert_profile_totals.size(); ++il) {
+                if (moe_expert_profile_totals[il].empty()) {
                     continue;
                 }
                 double total = 0.0;
-                for (const auto & kv : moe_heatmap_totals[il]) {
+                for (const auto & kv : moe_expert_profile_totals[il]) {
                     total += kv.second;
                 }
                 if (total <= 0.0) {
                     continue;
                 }
-                std::vector<std::pair<int32_t, int64_t>> hits(moe_heatmap_totals[il].begin(), moe_heatmap_totals[il].end());
+                std::vector<std::pair<int32_t, int64_t>> hits(moe_expert_profile_totals[il].begin(), moe_expert_profile_totals[il].end());
                 std::sort(hits.begin(), hits.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
                 file << "il=" << il;
                 for (const auto & h : hits) {
@@ -514,7 +514,7 @@ llama_context::~llama_context() {
                 }
                 file << "\n";
             }
-            LLAMA_LOG_INFO("%s: dumped MoE heatmap to '%s'\n", __func__, cparams.moe_heatmap_dump.c_str());
+            LLAMA_LOG_INFO("%s: dumped MoE expert profile to '%s'\n", __func__, cparams.moe_expert_profile_dump.c_str());
         }
     }
 
@@ -1474,7 +1474,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!cparams.moe_heatmap_dump.empty()) {
+        if (!cparams.moe_expert_profile_dump.empty()) {
             for (const auto & cap : routing_captures) {
                 if (cap.second && ggml_graph_size(gf) > ggml_graph_n_nodes(gf)) {
                     // keep the routing tensor alive until after the graph compute so the trace reads valid data
@@ -1509,7 +1509,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    moe_heatmap_flush();
+    moe_expert_profile_flush();
 
     ret = GGML_STATUS_SUCCESS;
 
@@ -2703,20 +2703,20 @@ llm_graph_cb llama_context::graph_get_cb() const {
             }
         }
 
-        // capture the MoE routing for the heatmap dump (re-captured on every graph rebuild)
-        if (!cparams.moe_heatmap_dump.empty() && name && strcmp(name, "ffn_moe_topk") == 0) {
+        // capture the MoE routing for the profile dump (re-captured on every graph rebuild)
+        if (!cparams.moe_expert_profile_dump.empty() && name && strcmp(name, "ffn_moe_topk") == 0) {
             routing_captures.emplace_back(il, cur);
         }
     };
 }
 
-void llama_context::moe_heatmap_flush() {
-    if (routing_captures.empty() || cparams.moe_heatmap_dump.empty()) {
+void llama_context::moe_expert_profile_flush() {
+    if (routing_captures.empty() || cparams.moe_expert_profile_dump.empty()) {
         return;
     }
 
-    if (moe_heatmap_totals.empty()) {
-        moe_heatmap_totals.resize(model.hparams.n_layer_all);
+    if (moe_expert_profile_totals.empty()) {
+        moe_expert_profile_totals.resize(model.hparams.n_layer_all);
     }
 
     std::vector<int32_t> buf;
@@ -2744,9 +2744,9 @@ void llama_context::moe_heatmap_flush() {
             }
         }
 
-        if (cap.first >= 0 && cap.first < (int) moe_heatmap_totals.size()) {
+        if (cap.first >= 0 && cap.first < (int) moe_expert_profile_totals.size()) {
             for (const auto & kv : counts) {
-                moe_heatmap_totals[cap.first][kv.first] += kv.second;
+                moe_expert_profile_totals[cap.first][kv.first] += kv.second;
             }
         }
     }
@@ -3870,7 +3870,7 @@ llama_context_params llama_context_default_params() {
         /*.defrag_thold                =*/ -1.0f,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
-        /*.moe_heatmap_dump            =*/ nullptr,
+        /*.moe_expert_profile_dump     =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,

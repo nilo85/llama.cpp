@@ -1655,8 +1655,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
 
-    mparams.moe_heatmap          = params.moe_heatmap.empty() ? nullptr : params.moe_heatmap.c_str();
-    mparams.moe_heatmap_fraction = params.moe_heatmap_fraction;
+    mparams.moe_expert_profile          = params.moe_expert_profile.empty() ? nullptr : params.moe_expert_profile.c_str();
+    mparams.moe_expert_split            = params.moe_expert_split;
     mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
     return mparams;
@@ -1689,7 +1689,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.flash_attn_type   = params.flash_attn_type;
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
-    cparams.moe_heatmap_dump  = params.moe_heatmap_dump.empty() ? nullptr : params.moe_heatmap_dump.c_str();
+    cparams.moe_expert_profile_dump  = params.moe_expert_profile_dump.empty() ? nullptr : params.moe_expert_profile_dump.c_str();
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;

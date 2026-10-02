@@ -1627,10 +1627,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             throw std::runtime_error("model has expert layers but no expert layers are used");
         }
 
-        if (n_expert > 0 && params.moe_heatmap_fraction >= 0.0f) {
+        if (n_expert > 0 && params.moe_expert_split >= 0.0f) {
             setup_moe_split(ml);
-        } else if (params.moe_heatmap && params.moe_heatmap[0]) {
-            LLAMA_LOG_WARN("%s: --moe-heatmap requires --moe-heatmap-fraction, ignoring\n", __func__);
+        } else if (params.moe_expert_profile && params.moe_expert_profile[0]) {
+            LLAMA_LOG_WARN("%s: --moe-expert-profile requires --moe-expert-split, ignoring\n", __func__);
         }
 
         layers.resize(n_layer_all);
@@ -2943,8 +2943,8 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
-        /*.moe_heatmap                 =*/ nullptr,
-        /*.moe_heatmap_fraction        =*/ -1.0f,
+        /*.moe_expert_profile          =*/ nullptr,
+        /*.moe_expert_split           =*/ -1.0f,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
@@ -3413,7 +3413,7 @@ static std::vector<int32_t> make_seed_order(int n_expert) {
 }
 
 void llama_model_base::setup_moe_split(llama_model_loader & ml) {
-    const float f = params.moe_heatmap_fraction;
+    const float f = params.moe_expert_split;
 
     // K derived from the fraction: finer fraction -> more parts
     const int n_expert_parts = f <= 0.0f ? 2 : std::clamp((int) std::round(1.0f / f), 2, 32);
@@ -3426,13 +3426,13 @@ void llama_model_base::setup_moe_split(llama_model_loader & ml) {
     // the first N_gpu experts of the per-layer ordering are the hot set
     const int n_gpu = (int) std::round(f * n_expert);
 
-    const bool use_file = params.moe_heatmap && params.moe_heatmap[0];
+    const bool use_file = params.moe_expert_profile && params.moe_expert_profile[0];
     moe_expert_order.assign(n_layer, make_seed_order(n_expert));
 
     if (use_file) {
-        std::ifstream file(params.moe_heatmap);
+        std::ifstream file(params.moe_expert_profile);
         if (!file) {
-            LLAMA_LOG_ERROR("%s: failed to open MoE heatmap file '%s', using seed order\n", __func__, params.moe_heatmap);
+            LLAMA_LOG_ERROR("%s: failed to open MoE expert profile file '%s', using seed order\n", __func__, params.moe_expert_profile);
         } else {
             std::string line;
             while (std::getline(file, line)) {
@@ -3517,8 +3517,8 @@ void llama_model_base::setup_moe_split(llama_model_loader & ml) {
     }
 
     if (use_file) {
-        LLAMA_LOG_INFO("%s: MoE heatmap from '%s': %d layers x %d experts, %d/%d parts per layer on local GPU\n",
-                __func__, params.moe_heatmap, n_layer, n_expert, n_hot, n_expert_parts);
+        LLAMA_LOG_INFO("%s: MoE expert profile from '%s': %d layers x %d experts, %d/%d parts per layer on local GPU\n",
+                __func__, params.moe_expert_profile, n_layer, n_expert, n_hot, n_expert_parts);
     } else {
         LLAMA_LOG_INFO("%s: MoE split (seed order): %d layers x %d experts, %d/%d parts per layer on local GPU\n",
                 __func__, n_layer, n_expert, n_hot, n_expert_parts);

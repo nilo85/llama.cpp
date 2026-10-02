@@ -346,11 +346,11 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
-        // optional: MoE heatmap file refining expert part placement (hot parts -> local GPU, cold -> CPU);
-        // only has an effect when moe_heatmap_fraction is set
-        const char * moe_heatmap;
+        // optional: MoE expert profile file refining expert part placement (hot parts -> local GPU, cold -> CPU);
+        // only has an effect when moe_expert_split is set
+        const char * moe_expert_profile;
         // enables the per-expert MoE split; fraction of each layer's routed experts kept on the local GPU (-1 = disabled)
-        float        moe_heatmap_fraction;
+        float        moe_expert_split;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
@@ -398,8 +398,8 @@ extern "C" {
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
 
-        // optional: collect MoE expert usage and dump the full heatmap to FILE on exit (opt-in, per-step readback cost)
-        const char * moe_heatmap_dump;
+        // optional: collect MoE expert usage and dump the full profile to FILE on exit (opt-in, per-step readback cost)
+        const char * moe_expert_profile_dump;
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]

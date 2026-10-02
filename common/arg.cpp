@@ -2757,30 +2757,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_OVERRIDE_TENSOR"));
     add_opt(common_arg(
-        {"--moe-heatmap"}, "<file>",
-        "load an MoE heatmap (il=<layer> <expert>:<score>) to order expert parts hottest-first; needs --moe-heatmap-fraction to enable the split",
+        {"--moe-expert-profile"}, "<file>",
+        "load an MoE expert profile (il=<layer> <expert>:<score>) to order expert parts hottest-first; needs --moe-expert-split to enable the split",
         [](common_params & params, const std::string & value) {
-            params.moe_heatmap = value;
+            params.moe_expert_profile = value;
         }
-    ).set_env("LLAMA_ARG_MOE_HEATMAP"));
+    ).set_env("LLAMA_ARG_MOE_EXPERT_PROFILE"));
     add_opt(common_arg(
-        {"--moe-heatmap-dump"}, "<file>",
-        "collect MoE expert usage and dump the full heatmap to FILE on exit (opt-in, adds a per-step readback)",
+        {"--moe-expert-profile-dump"}, "<file>",
+        "collect MoE expert usage and dump the full profile to FILE on exit (opt-in, adds a per-step readback)",
         [](common_params & params, const std::string & value) {
-            params.moe_heatmap_dump = value;
+            params.moe_expert_profile_dump = value;
         }
-    ).set_env("LLAMA_ARG_MOE_HEATMAP_DUMP"));
+    ).set_env("LLAMA_ARG_MOE_EXPERT_PROFILE_DUMP"));
     add_opt(common_arg(
-        {"--moe-heatmap-fraction"}, "F",
+        {"--moe-expert-split"}, "F",
         "enables the per-expert MoE split; fraction of each layer's routed experts kept on the local GPU, rest on CPU (default: disabled)",
         [](common_params & params, const std::string & value) {
             const float f = std::stof(value);
             if (f < 0.0f || f > 1.0f) {
-                throw std::invalid_argument("error: --moe-heatmap-fraction must be in [0, 1]");
+                throw std::invalid_argument("error: --moe-expert-split must be in [0, 1]");
             }
-            params.moe_heatmap_fraction = f;
+            params.moe_expert_split = f;
         }
-    ).set_env("LLAMA_ARG_MOE_HEATMAP_FRACTION"));
+    ).set_env("LLAMA_ARG_MOE_EXPERT_SPLIT"));
     add_opt(common_arg(
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",
