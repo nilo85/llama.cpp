@@ -3357,7 +3357,7 @@ void llama_model_base::load_moe_heatmap(int n_expert_parts) {
     const int n_layer  = hparams.n_layer_all;
     const int n_expert = (int) hparams.n_expert;
 
-    moe_heatmap.assign(n_layer, std::vector<int64_t>(n_expert, 0));
+    moe_heatmap.assign(n_layer, std::vector<double>(n_expert, 0.0));
 
     std::string line;
     while (std::getline(file, line)) {
@@ -3371,18 +3371,24 @@ void llama_model_base::load_moe_heatmap(int n_expert_parts) {
         if (il < 0 || il >= n_layer) {
             continue;
         }
-        size_t pos = line.find_first_not_of(" \t", 3);
+        // skip the layer number to the first expert token
+        size_t pos = line.find_first_of(" \t", 3);
+        if (pos != std::string::npos) {
+            pos = line.find_first_not_of(" \t", pos);
+        }
         while (pos != std::string::npos) {
             const size_t colon = line.find(':', pos);
             if (colon == std::string::npos) {
                 break;
             }
-            const int     expert = atoi(line.c_str() + pos);
-            const int64_t score  = atoll(line.c_str() + colon + 1);
+            const int    expert = atoi(line.c_str() + pos);
+            const double score  = atof(line.c_str() + colon + 1);
             if (expert >= 0 && expert < n_expert) {
                 moe_heatmap[il][expert] += score;
             }
-            pos = line.find_first_not_of(" \t", colon + 1);
+            // advance past the score to the next expert token
+            const size_t sp = line.find_first_of(" \t", colon + 1);
+            pos = (sp == std::string::npos) ? std::string::npos : line.find_first_not_of(" \t", sp);
         }
     }
 
@@ -3391,7 +3397,7 @@ void llama_model_base::load_moe_heatmap(int n_expert_parts) {
     moe_hot_parts.assign(n_layer, std::vector<char>(n_expert_parts, 0));
 
     for (int il = 0; il < n_layer; ++il) {
-        std::vector<int64_t> part_scores(n_expert_parts, 0);
+        std::vector<double> part_scores(n_expert_parts, 0.0);
         for (int p = 0; p < n_expert_parts; ++p) {
             const int e0 = p * (n_expert / n_expert_parts);
             const int e1 = (p + 1 < n_expert_parts) ? (p + 1) * (n_expert / n_expert_parts) : n_expert;

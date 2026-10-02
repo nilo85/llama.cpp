@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -492,16 +493,24 @@ llama_context::~llama_context() {
         if (!file) {
             LLAMA_LOG_ERROR("%s: failed to open MoE heatmap dump file '%s'\n", __func__, cparams.moe_heatmap_dump.c_str());
         } else {
-            file << "# MoE heatmap: il=<layer> <expert>:<score> ... (sorted by score desc, placement-independent)\n";
+            file << std::fixed << std::setprecision(6);
+            file << "# MoE heatmap: il=<layer> <expert>:<score> ... (score = fraction of the layer's routing, sums to 1 per layer; sorted desc; placement-independent)\n";
             for (size_t il = 0; il < moe_heatmap_totals.size(); ++il) {
                 if (moe_heatmap_totals[il].empty()) {
+                    continue;
+                }
+                double total = 0.0;
+                for (const auto & kv : moe_heatmap_totals[il]) {
+                    total += kv.second;
+                }
+                if (total <= 0.0) {
                     continue;
                 }
                 std::vector<std::pair<int32_t, int64_t>> hits(moe_heatmap_totals[il].begin(), moe_heatmap_totals[il].end());
                 std::sort(hits.begin(), hits.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
                 file << "il=" << il;
                 for (const auto & h : hits) {
-                    file << " " << h.first << ":" << h.second;
+                    file << " " << h.first << ":" << (double) h.second / total;
                 }
                 file << "\n";
             }

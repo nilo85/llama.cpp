@@ -843,7 +843,7 @@ struct llama_model_base : public llama_model {
 
     // MoE heatmap placement (params.moe_heatmap): per-layer expert scores and the per-part hot/cold decision
     // used by get_expert_split_buft (hot -> local GPU, cold -> CPU); empty = disabled
-    std::vector<std::vector<int64_t>> moe_heatmap;
+    std::vector<std::vector<double>> moe_heatmap;
     std::vector<std::vector<char>>    moe_hot_parts;
 
     // parse the MoE heatmap file and precompute the hot parts per layer (called from load_tensors)
