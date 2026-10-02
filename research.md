@@ -325,3 +325,10 @@ Short answer: **no, not on this rig.**
 - Real caveats would be FUSE/network/overlay-backed model files, SELinux/AppArmor read denials, or O_DIRECT alignment/fallback issues. None of those apply to the current Qwen3.8-Flash-Next test path.
 
 No new user story created: the podman/`ro` mount is not a plausible cause of the lazy/MTP/VMM issues we are chasing.
+
+## gemma4 expert-split load failure — root cause (2026-10-02)
+- Symptom: with `--moe-heatmap-fraction 0.5` (K=2), gemma-4-26B-A4B UD-Q4_K_XL fails at load: `done_getting_tensors: wrong number of tensors; expected 658, got 628` (-30 = one per MoE layer). Unsplit load fine. qwen4exp split fine.
+- Cause: UD (mixed-quant) gemma stores the experts' per-expert scale as a SEPARATE GGUF tensor `blk.N.ffn_down_exps.scale` (F32, {n_expert=128}; weight is Q2_K, gate_up is IQ1_S). The full-tensor scale is created by the generic post-arch scale pass in llama-model.cpp, gated on `layer.ffn_down_exps` being non-null. The expert-SPLIT path nulls `layer.ffn_down_exps` (full tensors are skipped, parts used instead) -> gate dead -> scale tensor never created -> count mismatch. qwen is unaffected: Q3_K keeps scales inside the block layout, no separate .scale tensors.
+- Counting semantics (loader): `n_tensors` = file count (weights_map snapshot at construction); TENSOR_SKIP'd-in-file tensors increment n_created; expert PARTS increment n_part_tensors, never n_created; parts are file-mapped via the original weight's entry (orig_w->offs + part offset) and re-registered under the part name.
+- Fix (A, in preset): skip the 4 `("scale",{n_expert})` originals (counted if present) + create 1D scale parts `{n_e}` at `e0*scale_nb0` into the already-plumbed `ffn_*_exps_s_parts` (graph applies them via build_lora_mm_id w_s: reshape {1,n_e,1}, get_rows(local ids)).
+- Design ruling (user): shared split code must NOT become a super-central loader; warm/cold offload must be cheap to enable for every MoE model. Refactor (mandatory next): generic per-tensor "split into K placed parts" primitive + standard-MoE preset on top; per-model layout quirks stay in the model's load_arch_tensors.
