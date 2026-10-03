@@ -271,6 +271,9 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
+    // read back the captured ffn_moe_topk tensors and accumulate the per-layer expert counts for the profile dump
+    void moe_expert_profile_flush();
+
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
@@ -289,6 +292,13 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+
+    // MoE expert profile dump (cparams.moe_expert_profile_dump): ffn_moe_topk nodes captured at graph build,
+    // read back after each compute; mutable because graph_get_cb() is const
+    mutable std::vector<std::pair<int, ggml_tensor *>> routing_captures;
+
+    // MoE expert profile dump (cparams.moe_expert_profile_dump): per-layer expert usage accumulated over the run, dumped on exit
+    std::vector<std::map<int32_t, int64_t>> moe_expert_profile_totals;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

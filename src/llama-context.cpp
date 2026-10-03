@@ -13,9 +13,12 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -140,6 +143,7 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    cparams.moe_expert_profile_dump  = params.moe_expert_profile_dump ? params.moe_expert_profile_dump : "";
 
     cparams.ctx_other = nullptr;
 
@@ -483,6 +487,36 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    if (!cparams.moe_expert_profile_dump.empty() && !moe_expert_profile_totals.empty()) {
+        std::ofstream file(cparams.moe_expert_profile_dump.c_str());
+        if (!file) {
+            LLAMA_LOG_ERROR("%s: failed to open MoE expert profile dump file '%s'\n", __func__, cparams.moe_expert_profile_dump.c_str());
+        } else {
+            file << std::fixed << std::setprecision(6);
+            file << "# MoE expert profile: il=<layer> <expert>:<score> ... (score = fraction of the layer's routing, sums to 1 per layer; sorted desc; placement-independent)\n";
+            for (size_t il = 0; il < moe_expert_profile_totals.size(); ++il) {
+                if (moe_expert_profile_totals[il].empty()) {
+                    continue;
+                }
+                double total = 0.0;
+                for (const auto & kv : moe_expert_profile_totals[il]) {
+                    total += kv.second;
+                }
+                if (total <= 0.0) {
+                    continue;
+                }
+                std::vector<std::pair<int32_t, int64_t>> hits(moe_expert_profile_totals[il].begin(), moe_expert_profile_totals[il].end());
+                std::sort(hits.begin(), hits.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
+                file << "il=" << il;
+                for (const auto & h : hits) {
+                    file << " " << h.first << ":" << (double) h.second / total;
+                }
+                file << "\n";
+            }
+            LLAMA_LOG_INFO("%s: dumped MoE expert profile to '%s'\n", __func__, cparams.moe_expert_profile_dump.c_str());
+        }
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -1423,6 +1457,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     } else {
         gf_res_prev_active = nullptr;
         res->reset();
+        routing_captures.clear(); // old graph nodes are stale after reset
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
@@ -1437,6 +1472,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
+        }
+
+        if (!cparams.moe_expert_profile_dump.empty()) {
+            for (const auto & cap : routing_captures) {
+                if (cap.second && ggml_graph_size(gf) > ggml_graph_n_nodes(gf)) {
+                    // keep the routing tensor alive until after the graph compute so the trace reads valid data
+                    ggml_graph_add_node(gf, cap.second);
+                }
+            }
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
@@ -1464,6 +1508,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = status;
         return nullptr;
     }
+
+    moe_expert_profile_flush();
 
     ret = GGML_STATUS_SUCCESS;
 
@@ -2656,7 +2702,54 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 }
             }
         }
+
+        // capture the MoE routing for the profile dump (re-captured on every graph rebuild)
+        if (!cparams.moe_expert_profile_dump.empty() && name && strcmp(name, "ffn_moe_topk") == 0) {
+            routing_captures.emplace_back(il, cur);
+        }
     };
+}
+
+void llama_context::moe_expert_profile_flush() {
+    if (routing_captures.empty() || cparams.moe_expert_profile_dump.empty()) {
+        return;
+    }
+
+    if (moe_expert_profile_totals.empty()) {
+        moe_expert_profile_totals.resize(model.hparams.n_layer_all);
+    }
+
+    std::vector<int32_t> buf;
+    for (const auto & cap : routing_captures) {
+        ggml_tensor * t = cap.second;
+        if (t == nullptr || t->type != GGML_TYPE_I32) {
+            continue;
+        }
+
+        const int64_t n0 = t->ne[0];
+        buf.resize(n0);
+
+        std::map<int32_t, int64_t> counts;
+        for (int64_t i3 = 0; i3 < t->ne[3]; i3++) {
+            for (int64_t i2 = 0; i2 < t->ne[2]; i2++) {
+                for (int64_t i1 = 0; i1 < t->ne[1]; i1++) {
+                    const size_t off = i1*t->nb[1] + i2*t->nb[2] + i3*t->nb[3];
+                    ggml_backend_tensor_get(t, buf.data(), off, n0*sizeof(int32_t));
+                    for (const int32_t e : buf) {
+                        if (e >= 0) {
+                            counts[e]++;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (cap.first >= 0 && cap.first < (int) moe_expert_profile_totals.size()) {
+            for (const auto & kv : counts) {
+                moe_expert_profile_totals[cap.first][kv.first] += kv.second;
+            }
+        }
+    }
 }
 
 //
@@ -3777,6 +3870,7 @@ llama_context_params llama_context_default_params() {
         /*.defrag_thold                =*/ -1.0f,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
+        /*.moe_expert_profile_dump     =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,

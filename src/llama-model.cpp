@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <numeric>
@@ -1626,10 +1627,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             throw std::runtime_error("model has expert layers but no expert layers are used");
         }
 
+        if (n_expert > 0 && params.moe_expert_split >= 0.0f) {
+            setup_moe_split(ml);
+        } else if (params.moe_expert_profile && params.moe_expert_profile[0]) {
+            LLAMA_LOG_WARN("%s: --moe-expert-profile requires --moe-expert-split, ignoring\n", __func__);
+        }
+
         layers.resize(n_layer_all);
 
         // call the per-model loading function
         load_arch_tensors(ml);
+
+        // move the loader's stashed expert weight parts into the layer vectors before the scale pass,
+        // so the per-expert scale gates (which also fire under split) see the filled parts
+        drain_expert_parts(ml);
 
         // generic pass: load optional per-tensor/per-expert ".scale" tensors (e.g. NVFP4 scale2)
         // this avoids having to add scale loading to every architecture
@@ -1676,15 +1687,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 layer.ffn_up_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
 
-            // MoE expert weight scales (per-expert, shape {n_expert})
-            if (!layer.ffn_gate_exps_s && layer.ffn_gate_exps) {
-                layer.ffn_gate_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+            // MoE expert weight scales (per-expert, shape {n_expert}); under split the full tensors are
+            // null but the parts are filled, so gate on either and tag TENSOR_EXPERT to slice the scales
+            if (!layer.ffn_gate_exps_s && (layer.ffn_gate_exps || !layer.ffn_gate_exps_parts.empty())) {
+                layer.ffn_gate_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED | TENSOR_EXPERT);
             }
-            if (!layer.ffn_down_exps_s && layer.ffn_down_exps) {
-                layer.ffn_down_exps_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+            if (!layer.ffn_down_exps_s && (layer.ffn_down_exps || !layer.ffn_down_exps_parts.empty())) {
+                layer.ffn_down_exps_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED | TENSOR_EXPERT);
             }
-            if (!layer.ffn_up_exps_s && layer.ffn_up_exps) {
-                layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+            if (!layer.ffn_up_exps_s && (layer.ffn_up_exps || !layer.ffn_up_exps_parts.empty())) {
+                layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED | TENSOR_EXPERT);
             }
 
             // recurrent / linear-attention weight scales (per-tensor, shape {1})
@@ -1784,6 +1796,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
+
+    // move the loader's stashed expert scale parts into the layer vectors (weight parts were drained earlier)
+    drain_expert_parts(ml);
 
     ml.done_getting_tensors();
 
@@ -2928,6 +2943,8 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.moe_expert_profile          =*/ nullptr,
+        /*.moe_expert_split           =*/ -1.0f,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
@@ -3378,12 +3395,180 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
     TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
     TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),
-    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY) {}
+    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY),
+    TENSOR_EXPERT         (llama_model_loader::TENSOR_EXPERT) {}
 
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);
     return create_tensor(*ml, tn, ne, flags);
 }
+
+
+
+// identity seed ordering; swap this out to try random or heuristic seeds
+static std::vector<int32_t> make_seed_order(int n_expert) {
+    std::vector<int32_t> order(n_expert);
+    std::iota(order.begin(), order.end(), 0);
+    return order;
+}
+
+void llama_model_base::setup_moe_split(llama_model_loader & ml) {
+    const float f = params.moe_expert_split;
+
+    // K derived from the fraction: finer fraction -> more parts
+    const int n_expert_parts = f <= 0.0f ? 2 : std::clamp((int) std::round(1.0f / f), 2, 32);
+    moe_split_k = n_expert_parts;
+    ml.reserve_part_tensors(static_cast<int>(hparams.n_layer_all)*3*n_expert_parts);
+
+    const int n_layer  = hparams.n_layer_all;
+    const int n_expert = (int) hparams.n_expert;
+
+    // the first N_gpu experts of the per-layer ordering are the hot set
+    const int n_gpu = (int) std::round(f * n_expert);
+
+    const bool use_file = params.moe_expert_profile && params.moe_expert_profile[0];
+    moe_expert_order.assign(n_layer, make_seed_order(n_expert));
+
+    if (use_file) {
+        std::ifstream file(params.moe_expert_profile);
+        if (!file) {
+            LLAMA_LOG_ERROR("%s: failed to open MoE expert profile file '%s', using seed order\n", __func__, params.moe_expert_profile);
+        } else {
+            std::string line;
+            while (std::getline(file, line)) {
+                if (line.empty() || line[0] == '#' || line.rfind("il=", 0) != 0) {
+                    continue;
+                }
+                const int il = atoi(line.c_str() + 3);
+                if (il < 0 || il >= n_layer) {
+                    continue;
+                }
+                // keep the file's expert order, ignore the score values
+                std::vector<int32_t> order;
+                std::vector<char> seen(n_expert, 0);
+                size_t pos = line.find_first_of(" \t", 3);
+                if (pos != std::string::npos) {
+                    pos = line.find_first_not_of(" \t", pos);
+                }
+                while (pos != std::string::npos) {
+                    const size_t colon = line.find(':', pos);
+                    if (colon == std::string::npos) {
+                        break;
+                    }
+                    const int expert = atoi(line.c_str() + pos);
+                    if (expert >= 0 && expert < n_expert && !seen[expert]) {
+                        seen[expert] = 1;
+                        order.push_back(expert);
+                    }
+                    // advance past the score to the next expert token
+                    const size_t sp = line.find_first_of(" \t", colon + 1);
+                    pos = (sp == std::string::npos) ? std::string::npos : line.find_first_not_of(" \t", sp);
+                }
+                if (!order.empty()) {
+                    // experts missing from the file go to the tail in index order
+                    for (int e = 0; e < n_expert; ++e) {
+                        if (!seen[e]) {
+                            order.push_back(e);
+                        }
+                    }
+                    moe_expert_order[il] = std::move(order);
+                }
+            }
+        }
+    }
+
+    // rank each layer's parts by hot-set membership; the hottest parts go to the local GPU
+    const int n_hot = std::clamp((int) std::round(n_expert_parts * f), 0, n_expert_parts);
+    moe_hot_parts.assign(n_layer, std::vector<char>(n_expert_parts, 0));
+
+    for (int il = 0; il < n_layer; ++il) {
+        std::vector<int> pos(n_expert, 0);
+        for (int i = 0; i < n_expert; ++i) {
+            pos[moe_expert_order[il][i]] = i;
+        }
+
+        std::vector<int> part_hot(n_expert_parts, 0);
+        for (int p = 0; p < n_expert_parts; ++p) {
+            const int e0 = p * (n_expert / n_expert_parts);
+            const int e1 = (p + 1 < n_expert_parts) ? (p + 1) * (n_expert / n_expert_parts) : n_expert;
+            for (int e = e0; e < e1; ++e) {
+                if (pos[e] < n_gpu) {
+                    part_hot[p]++;
+                }
+            }
+        }
+
+        std::vector<int> order(n_expert_parts);
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](int a, int b) {
+            return part_hot[a] != part_hot[b] ? part_hot[a] > part_hot[b] : a < b;
+        });
+        for (int i = 0; i < n_hot; ++i) {
+            moe_hot_parts[il][order[i]] = 1;
+        }
+
+        LLAMA_LOG_DEBUG("%s: layer %3d: hot parts = ", __func__, il);
+        for (int p = 0; p < n_expert_parts; ++p) {
+            if (moe_hot_parts[il][p]) {
+                LLAMA_LOG_DEBUG("%d ", p);
+            }
+        }
+        LLAMA_LOG_DEBUG("\n");
+    }
+
+    if (use_file) {
+        LLAMA_LOG_INFO("%s: MoE expert profile from '%s': %d layers x %d experts, %d/%d parts per layer on local GPU\n",
+                __func__, params.moe_expert_profile, n_layer, n_expert, n_hot, n_expert_parts);
+    } else {
+        LLAMA_LOG_INFO("%s: MoE split (seed order): %d layers x %d experts, %d/%d parts per layer on local GPU\n",
+                __func__, n_layer, n_expert, n_hot, n_expert_parts);
+    }
+
+    // arm the loader so TENSOR_EXPERT tensors are byte-sliced instead of created whole
+    ml.moe_split.enabled   = moe_split_k > 1;
+    ml.moe_split.k         = moe_split_k;
+    ml.moe_split.hot_parts = moe_hot_parts;
+    ml.moe_split.local_buft.resize(n_layer);
+    for (int il = 0; il < n_layer; ++il) {
+        ml.moe_split.local_buft[il] = pimpl->dev_layer[il].buft_list->at(0).second;
+    }
+}
+
+void llama_model_base::drain_expert_parts(llama_model_loader & ml) {
+    const int n_layer_all = hparams.n_layer_all;
+
+    for (int il = 0; il < n_layer_all; ++il) {
+        auto & layer = layers[il];
+
+        auto drain = [&](llm_tensor tensor, const char * suffix, std::vector<ggml_tensor *> & parts) {
+            const std::string name = tn(tensor, suffix, il).str();
+            auto it = ml.expert_parts.find(name);
+            if (it != ml.expert_parts.end()) {
+                parts = std::move(it->second);
+                ml.expert_parts.erase(it);
+            }
+        };
+
+        drain(LLM_TENSOR_FFN_DOWN_EXPS,    "weight", layer.ffn_down_exps_parts);
+        drain(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", layer.ffn_gate_up_exps_parts);
+        drain(LLM_TENSOR_FFN_GATE_EXPS,    "weight", layer.ffn_gate_exps_parts);
+        drain(LLM_TENSOR_FFN_UP_EXPS,      "weight", layer.ffn_up_exps_parts);
+        drain(LLM_TENSOR_FFN_DOWN_EXPS,    "scale",  layer.ffn_down_exps_s_parts);
+        drain(LLM_TENSOR_FFN_GATE_EXPS,    "scale",  layer.ffn_gate_exps_s_parts);
+        drain(LLM_TENSOR_FFN_UP_EXPS,      "scale",  layer.ffn_up_exps_s_parts);
+
+        if (!layer.ffn_down_exps_parts.empty() || !layer.ffn_gate_up_exps_parts.empty() ||
+            !layer.ffn_gate_exps_parts.empty() || !layer.ffn_up_exps_parts.empty()) {
+            const int n_expert = (int) hparams.n_expert;
+            layer.ffn_expert_part_offsets.clear();
+            for (int p = 0; p < moe_split_k; ++p) {
+                layer.ffn_expert_part_offsets.push_back((int64_t) p * (n_expert / moe_split_k));
+            }
+        }
+    }
+}
+
+
 
 void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {
     if (flags & TENSOR_SKIP) {
@@ -3395,8 +3580,11 @@ void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, 
         return;
     }
 
-    layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, TENSOR_NOT_REQUIRED);
-    if (layer.ffn_gate_up_exps == nullptr) {
+    // under TENSOR_EXPERT a present gate_up may return null (split into parts), so key the fallback
+    // on whether the gate_up tensor exists in the file, not on the returned pointer
+    if (ml->get_tensor_meta(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid).str().c_str()) != nullptr) {
+        layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, flags | TENSOR_NOT_REQUIRED);
+    } else {
         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
     }

@@ -352,6 +352,17 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_exps_s   = nullptr;
     struct ggml_tensor * ffn_up_exps_s     = nullptr;
 
+    // optional expert partitioning: when non-empty, the MoE FFN is built as one masked subgraph per part
+    std::vector<struct ggml_tensor *> ffn_gate_up_exps_parts;
+    std::vector<struct ggml_tensor *> ffn_gate_exps_parts;
+    std::vector<struct ggml_tensor *> ffn_up_exps_parts;
+    std::vector<struct ggml_tensor *> ffn_down_exps_parts;
+    std::vector<struct ggml_tensor *> ffn_gate_up_exps_s_parts;
+    std::vector<struct ggml_tensor *> ffn_gate_exps_s_parts;
+    std::vector<struct ggml_tensor *> ffn_up_exps_s_parts;
+    std::vector<struct ggml_tensor *> ffn_down_exps_s_parts;
+    std::vector<int64_t> ffn_expert_part_offsets; // expert index of the first expert in each part
+
     // ff MoE latent proj
     struct ggml_tensor * ffn_latent_down = nullptr;
     struct ggml_tensor * ffn_latent_up   = nullptr;
@@ -827,6 +838,7 @@ struct llama_model_base : public llama_model {
     const int TENSOR_SKIP_IF_VIRTUAL;
     const int TENSOR_ALLOW_RESHAPE;
     const int TENSOR_READ_LAZY;
+    const int TENSOR_EXPERT;
 
     explicit llama_model_base(const llama_model_params & params);
     virtual ~llama_model_base() = default;
@@ -835,6 +847,22 @@ struct llama_model_base : public llama_model {
 
     // convenience overload of create_tensor that doesn't require llama_model_loader
     ggml_tensor * create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    // MoE expert split (params.moe_expert_split >= 0): K parts per layer, derived from the fraction
+    int moe_split_k = 0; // 0 = split disabled
+
+    // per-layer expert ordering (file order, or identity seed) and the per-part hot/cold decision
+    // used to arm the loader (hot -> local GPU, cold -> CPU); empty = disabled
+    std::vector<std::vector<int32_t>> moe_expert_order;
+    std::vector<std::vector<char>>    moe_hot_parts;
+
+    // derive K from the fraction, load the per-layer order (file, or seed), precompute the hot parts
+    // and arm the loader so TENSOR_EXPERT tensors are byte-sliced instead of created whole
+    void setup_moe_split(llama_model_loader & ml);
+
+    // move the loader's stashed expert parts into the layer part vectors (idempotent; call after
+    // load_arch_tensors and again after the scale pass so both weight and scale parts land)
+    void drain_expert_parts(llama_model_loader & ml);
 
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,
