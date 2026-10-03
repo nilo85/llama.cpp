@@ -13,7 +13,6 @@
 
 #include <array>
 #include <map>
-#include <utility>
 #include <vector>
 
 struct llama_model;
