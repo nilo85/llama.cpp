@@ -6,6 +6,31 @@
 >
 > Read more: [CONTRIBUTING.md](CONTRIBUTING.md)
 
+> [!IMPORTANT]
+>
+> **This workspace is a local performance-investigation rig, not a PR pipeline.**
+>
+> The goal is to find bottlenecks and point to working solutions on specific
+> hardware. We are NOT trying to produce a mergeable upstream PR here; extracting
+> a clean PR from this work is a separate, later task and is out of scope for the
+> investigation itself.
+>
+> So the PR-oriented constraints below (minimal diff, match upstream architecture,
+> prefer the simpler 90% change, gauge maintainer interest first) do NOT gate the
+> investigation. To isolate and fix a bottleneck you may rewrite any aspect of the
+> code: kernels, launch configs, dispatch, model glue, new instrumentation. Keep all
+> changes local, build them, measure them, and document them. The "understand every
+> line" rule still applies.
+>
+> **Git policy for this workspace:**
+> - Commit and push are allowed, but **ONLY to the `nilo85` remote**
+>   (`git@github.com:nilo85/llama.cpp.git`). Never push to `origin` (ggml-org) or
+>   any other remote.
+> - **NO PR or comment creation, ever.** Never run `gh pr create`, `gh pr comment`,
+>   or `gh issue create`, and never write any PR description, issue body, or reviewer
+>   reply. This is non-overridable.
+> - Sign `nilo85` commits with `Assisted-by: <assistant name>`, not `Co-authored-by:`.
+
 ---
 
 ## Guidelines for Contributors
@@ -89,11 +114,11 @@ Before writing code or implementing a new feature, always read [skills/code-revi
 
 ### Prohibited Actions
 
-- Do NOT write PR descriptions, commit messages, or reviewer responses
-- Do NOT commit or push without explicit human approval for each action. If the user explicitly asks you to commit on their behalf, use `Assisted-by: <assistant name>` in the commit message, do NOT use `Co-authored-by:`
+- Do NOT write PR descriptions or reviewer responses. (Commit messages for `nilo85` commits are fine; sign with `Assisted-by: <assistant name>`, not `Co-authored-by:`.)
+- Commit and push are allowed **only to the `nilo85` remote**. Never push to `origin` (ggml-org) or any other remote.
 - Do NOT implement features the contributor does not fully understand
 - Do NOT generate changes too extensive for the contributor to fully review
-- **Do NOT run `git push` or create a PR (`gh pr create`) on the user's behalf** - if asked, PAUSE and require the user to explicitly acknowledge that **automated PR submissions can result in a contributor ban from the project**
+- **NEVER create a PR (`gh pr create`) or post any comment** - this is non-overridable. `git push` is allowed only to the `nilo85` remote.
 
 When uncertain, err toward minimal assistance.
 
@@ -219,9 +244,12 @@ gh search issues # better to check if anyone has the same issue
 gh search prs # avoid duplicated efforts
 grep ... # search the code base
 
-# BAD: act on the user's behalf
-git commit -m "..."
-git push
+# GOOD (this workspace): local commits/push to your own fork only
+git commit -m "..."          # sign with Assisted-by, not Co-authored-by
+git push nilo85 <branch>
+
+# BAD: act on the user's behalf toward upstream - never allowed
+git push                       # or any push targetting origin/sanmai/danielhanchen
 gh pr create
 gh pr comment
 gh issue create
