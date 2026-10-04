@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-stage-timing.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -771,7 +772,9 @@ void llama_context::synchronize() {
         return;
     }
 
+    gstage::Timer t_sync(gstage::ST_SYNC_CTX);
     ggml_backend_sched_synchronize(sched.get());
+    gstage::record_sync(gstage::ST_SYNC_CTX, __builtin_return_address(0), gstage::now_us() - t_sync.t0);
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1429,6 +1432,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
+        gstage::Timer t_build(gstage::ST_GRAPH_BUILD);
         gf = model.build_graph(gparams);
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
@@ -1453,6 +1457,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        gstage::Timer t_inputs(gstage::ST_SET_INPUTS);
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
@@ -1710,6 +1715,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    gstage::Timer t_decode(gstage::ST_DECODE_TOTAL);
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2623,6 +2629,7 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    gstage::Timer t_sched(gstage::ST_SCHED);
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -3990,7 +3997,11 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 }
 
 void llama_synchronize(llama_context * ctx) {
+    gstage::Timer t_api(gstage::ST_SYNC_API);
     ctx->synchronize();
+    if (gstage::state().enabled) {
+        gstage::record_sync(gstage::ST_SYNC_API, __builtin_return_address(0), gstage::now_us() - t_api.t0);
+    }
 }
 
 float * llama_get_logits(llama_context * ctx) {

@@ -5,6 +5,7 @@
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
+#include "ggml-stage-timing.h"
 #include "unary-ops.h"
 #include "vec.h"
 
@@ -5372,6 +5373,7 @@ void ggml_compute_forward_get_rows(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
 
+    gstage::Timer t_gr(gstage::ST_GET_ROWS);
     const ggml_tensor * src0 = dst->src[0];
 
     switch (src0->type) {

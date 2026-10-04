@@ -11,6 +11,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "ggml-stage-timing.h"
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
@@ -2972,6 +2973,7 @@ private:
 
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
+            gstage::Timer t_pre(gstage::ST_SLOT_PRE);
             pre_decode();
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
@@ -3010,7 +3012,10 @@ private:
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
-                batch.render(off, n_tokens);
+                {
+                    gstage::Timer t_render(gstage::ST_RENDER);
+                    batch.render(off, n_tokens);
+                }
                 bool ok = decode(n_batch, off);
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
@@ -3034,6 +3039,7 @@ private:
 
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
+                gstage::Timer t_post(gstage::ST_SLOT_POST);
                 post_decode(n_tokens, off);
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());

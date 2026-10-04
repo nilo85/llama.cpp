@@ -217,6 +217,13 @@ if (LLAMA_USE_SYSTEM_GGML)
     add_library(ggml ALIAS ggml::ggml)
 endif()
 
+# Stage-timing instrumentation: OFF (default) = clean production build (harness compiled out via
+# no-op stubs); ON = attribution build. Never benchmark the ON build.
+option(GGML_STAGE_TIMING "llama: enable stage-timing instrumentation (attribution only; OFF = clean production build)" OFF)
+if (GGML_STAGE_TIMING)
+    add_compile_definitions(GGML_STAGE_TIMING)
+endif()
+
 if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     set(GGML_BUILD_NUMBER ${LLAMA_BUILD_NUMBER})
     set(GGML_BUILD_COMMIT ${LLAMA_BUILD_COMMIT})

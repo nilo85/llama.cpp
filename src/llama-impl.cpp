@@ -2,6 +2,7 @@
 #include "llama-mmap.h"
 
 #include "ggml-backend.h"
+#include "ggml-stage-timing.h"
 #include "gguf.h"
 #include "llama.h"
 
@@ -25,6 +26,7 @@ void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_
         return;
     }
 
+    gstage::Timer t_pf(gstage::ST_PREFETCH);
     GGML_ASSERT(ggml_is_matrix(tensor));
 
     const size_t row_bytes = ggml_row_size(tensor->type, tensor->ne[0]);
