@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #define LLAMA_MAX_SEQ 256
@@ -63,6 +64,8 @@ struct llama_cparams {
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
+
+    std::string moe_expert_profile_dump; // optional: dump the full MoE usage profile to this file on exit
 
     llama_context * ctx_other;
 };

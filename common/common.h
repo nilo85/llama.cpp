@@ -496,6 +496,10 @@ struct common_params {
     ggml_backend_sched_eval_callback cb_eval = nullptr;
     void * cb_eval_user_data                 = nullptr;
 
+    std::string moe_expert_profile; // MoE expert profile file driving expert part placement (hot -> local GPU, cold -> CPU)
+    std::string moe_expert_profile_dump; // dump the full MoE usage profile to this file on exit (opt-in)
+    float moe_expert_split = -1.0f; // enables the per-expert MoE split; fraction of each layer's routed experts kept on the local GPU (-1 = disabled)
+
     ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
 
     enum llama_rope_scaling_type rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
