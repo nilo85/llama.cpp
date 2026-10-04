@@ -6,6 +6,7 @@
 #include "reasoning-budget.h"
 
 #include "ggml.h"
+#include "ggml-stage-timing.h"
 
 #include <algorithm>
 #include <cctype>
@@ -603,6 +604,7 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+    gstage::Timer t_sample(gstage::ST_SAMPLE);
     llama_synchronize(ctx);
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
