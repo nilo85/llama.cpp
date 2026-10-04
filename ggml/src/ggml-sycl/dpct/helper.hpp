@@ -791,8 +791,12 @@ namespace dpct
       void clear_queues() { _queues.clear(); }
 
       void init_queues() {
+#ifdef GGML_STAGE_TIMING
         _q_in_order =
-            create_queue_impl(true, sycl::property::queue::in_order());
+            create_queue_impl(true, sycl::property::queue::in_order(), sycl::property::queue::enable_profiling());
+#else
+        _q_in_order = create_queue_impl(true, sycl::property::queue::in_order());
+#endif
         _q_out_of_order = create_queue_impl(true);
         _saved_queue = default_queue();
       }

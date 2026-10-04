@@ -10,8 +10,8 @@
 
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
-#include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-stage-timing.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -1816,20 +1816,26 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
 
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-        } else {
-            ggml_backend_synchronize(split_backend);
+        {
+            gstage::Timer t_sync(gstage::ST_SCHED_SYNC);
+            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+            } else {
+                ggml_backend_synchronize(split_backend);
+            }
         }
         ggml_backend_tensor_copy(input, input_cpy);
         return;
     }
 
     // wait for the split backend to finish using the input before overwriting it
-    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-        ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-    } else {
-        ggml_backend_synchronize(split_backend);
+    {
+        gstage::Timer t_sync(gstage::ST_SCHED_SYNC);
+        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+            ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+        } else {
+            ggml_backend_synchronize(split_backend);
+        }
     }
 
     if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
@@ -1840,11 +1846,14 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-        ggml_backend_synchronize(input_backend);
-        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-        } else {
-            ggml_backend_synchronize(split_backend);
+        {
+            gstage::Timer t_sync(gstage::ST_SCHED_SYNC);
+            ggml_backend_synchronize(input_backend);
+            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+            } else {
+                ggml_backend_synchronize(split_backend);
+            }
         }
         ggml_backend_tensor_copy(input, input_cpy);
     }
@@ -1864,6 +1873,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+            gstage::Timer t_sync(gstage::ST_SCHED_SYNC);
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
@@ -1885,10 +1895,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (!sched->callback_eval) {
+#ifdef GGML_STAGE_TIMING
+            gstage::Timer t_comp(gstage::ST_SPLIT_COMPUTE);
+            const uint64_t t_sub0 = gstage::now_us();
+#endif
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
+#ifdef GGML_STAGE_TIMING
+            const uint64_t t_sub1 = gstage::now_us();
+            if (gstage::state().sync_pass) {
+                const uint64_t t_w0 = gstage::now_us();
+                ggml_backend_synchronize(split_backend);
+                gstage::record_split(split_id, t_sub1 - t_sub0, gstage::now_us() - t_w0);
+            }
+#endif
         } else {
             // similar to ggml_backend_compare_graph_backend
             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {

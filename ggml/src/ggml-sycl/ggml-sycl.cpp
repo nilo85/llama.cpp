@@ -54,6 +54,7 @@
 #include "ggml-sycl.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "ggml-stage-timing.h"
 
 #include "ggml-sycl/add-id.hpp"
 #include "ggml-sycl/backend.hpp"
@@ -740,27 +741,39 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                 ggml_tensor *tensor,
                                                 const void *data, size_t offset,
                                                 size_t size) try {
+    gstage::Timer t_total(gstage::ST_SET_TENSOR);
     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
     ggml_sycl_set_device(ctx->device);
     auto stream = &(dpct::dev_mgr::instance().get_device(ctx->device).default_queue());
-    // PLE-ASYNC experiment (us-ple-async): small per-token H2D copies (PLE emb ~KB, a normal host
-    // buffer from the CPU get_rows) are submitted async on the in-order default queue (no drain,
-    // no wait) so the host does NOT block; the consuming graph op is submitted later on the same
-    // queue, so ordering is preserved. Large/mmap'd model-load copies keep the host_buf workaround
-    // + blocking wait (correctness). Tests whether the per-token host->GPU sync block is the stall.
+    // PLE-ASYNC (us-ple-async): small per-token H2D copies (PLE emb ~KB, a normal host buffer from
+    // the CPU get_rows) are submitted async on the in-order default queue (no drain, no wait) so the
+    // host does NOT block; the consuming graph op is submitted later on the same queue, so ordering
+    // is preserved. Large/mmap'd model-load copies keep the host_buf workaround + blocking wait.
     if (size < (1u << 20)) {
         SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, data, size)));
     } else {
+        {
+            gstage::Timer t_drain(gstage::ST_SET_TENSOR_DRAIN);
+            SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
+        }
 #ifndef _WIN32
+        // Note: Use host buffer to save the data from mmap(), then copy to device. It's workaround for mmap() issue on PVC GPU.
+        // This function will be called during load model from disk. Use memory buffer replace dynamic won't save more time and brings potential memory leak risk here.
         char * host_buf = (char *) malloc(size);
         memcpy(host_buf, data, size);
-        SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, host_buf, size).wait()));
+        {
+            gstage::Timer t_memcpy(gstage::ST_SET_TENSOR_MEMCPY);
+            SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, host_buf, size).wait()));
+        }
         free(host_buf);
 #else
-        SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, data, size).wait()));
+        {
+            gstage::Timer t_memcpy(gstage::ST_SET_TENSOR_MEMCPY);
+            SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, data, size).wait()));
+        }
 #endif
     }
 }
@@ -782,6 +795,7 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
     ggml_sycl_set_device(ctx->device);
     auto stream = dpct::dev_mgr::instance().get_device(ctx->device).default_queue();
 
+    gstage::Timer t_get(gstage::ST_GET_TENSOR);
     SYCL_CHECK(CHECK_TRY_ERROR(
         stream.memcpy(data, (const char *)tensor->data + offset, size)
             .wait()));
@@ -856,6 +870,7 @@ static bool
 ggml_backend_sycl_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
                                     const ggml_tensor *src,
                                     ggml_tensor *dst) try {
+    gstage::Timer t_cpy(gstage::ST_CPY_TENSOR);
     bool is_cpy_supported = ggml_backend_buffer_is_sycl(src->buffer);
     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": dst", dst).c_str());
@@ -5267,6 +5282,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     const int64_t n_ids = ids->ne[0];
 
     if (ne12 == 1) {
+        gstage::Timer t_fused(gstage::ST_MOE_FUSED);
         if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
             return;
         }
@@ -5275,11 +5291,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     std::vector<char> ids_host(ggml_nbytes(ids));
     const char * ids_dev = (const char *) ids->data;
 
-    SYCL_CHECK(CHECK_TRY_ERROR(
-        stream->memcpy(ids_host.data(), ids_dev, ggml_nbytes(ids))));
+    {
+        gstage::Timer t_wait(gstage::ST_MOE_WAIT);
+        SYCL_CHECK(CHECK_TRY_ERROR(
+            stream->memcpy(ids_host.data(), ids_dev, ggml_nbytes(ids))));
 
-    // also ensures ctx.mmid_row_mapping_host is drained before we use it again
-    SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+        // also ensures ctx.mmid_row_mapping_host is drained before we use it again
+        SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+    }
 
     ggml_tensor src0_row = *src0;
     ggml_tensor src1_row = *src1;
@@ -5964,6 +5983,7 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
 
     GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
+    gstage::Timer t_async(gstage::ST_SET_TENSOR_ASYNC);
     SYCL_CHECK(CHECK_TRY_ERROR(
         (stream)->memcpy((char *)tensor->data + offset, data, size)));
 }
@@ -6116,8 +6136,30 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
     return skip;
 }
 
+// per-op device timing ring: (op, barrier submitted before the op's kernels). Harvested at the
+// start of the next graph_compute. Only used when GGML_STAGE_OP_TIMING=1.
+#ifdef GGML_STAGE_TIMING
+static std::vector<std::pair<int, sycl::event>> gstage_op_ring;
+#endif
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
+
+#ifdef GGML_STAGE_TIMING
+    const bool op_tim = gstage::state().enabled && gstage::state().op_timing;
+    if (op_tim) {
+        for (size_t k = 0; k + 1 < gstage_op_ring.size(); k++) {
+            auto & e0 = gstage_op_ring[k].second;
+            auto & e1 = gstage_op_ring[k + 1].second;
+            e0.wait();
+            e1.wait();
+            const uint64_t t0 = e0.get_profiling_info<sycl::info::event_profiling::command_end>();
+            const uint64_t t1 = e1.get_profiling_info<sycl::info::event_profiling::command_end>();
+            gstage::record_op(gstage_op_ring[k].first, t1 > t0 ? t1 - t0 : 0);
+        }
+        gstage_op_ring.clear();
+    }
+#endif
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -6127,6 +6169,12 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
+
+#ifdef GGML_STAGE_TIMING
+        if (op_tim) {
+            gstage_op_ring.emplace_back(node->op, sycl_ctx->stream()->ext_oneapi_submit_barrier());
+        }
+#endif
 
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
         if (nodes_to_skip != 0) {
@@ -6220,6 +6268,12 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         GGML_ASSERT(ok);
     }
+
+#ifdef GGML_STAGE_TIMING
+    if (op_tim) {
+        gstage_op_ring.emplace_back(-1, sycl_ctx->stream()->ext_oneapi_submit_barrier());
+    }
+#endif
 }
 
 #ifdef GGML_SYCL_GRAPH
@@ -6266,6 +6320,7 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
 #endif
 
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    gstage::Timer t_gc(gstage::ST_GRAPH_COMPUTE);
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
 
 #ifdef GGML_SYCL_GRAPH
@@ -6278,6 +6333,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         if (!graph_support) {
             GGML_SYCL_DEBUG("[SYCL-GRAPH] can not use graphs on device:%d\n", sycl_ctx->device);
             ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
+            gstage::on_graph_compute();
             return GGML_STATUS_SUCCESS;
         }
 
@@ -6311,6 +6367,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
     {
         ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
     }
+    gstage::on_graph_compute();
     return GGML_STATUS_SUCCESS;
 }
 
