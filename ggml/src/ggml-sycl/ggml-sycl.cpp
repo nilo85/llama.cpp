@@ -6338,7 +6338,13 @@ static void ggml_backend_sycl_event_wait(ggml_backend_t backend, ggml_backend_ev
     sycl::event* sycl_event = static_cast<sycl::event*>(event->context);
 
     if (ggml_backend_is_sycl(backend)) {
-        SYCL_CHECK(CHECK_TRY_ERROR(sycl_event->wait()));
+        ggml_backend_sycl_context *sycl_ctx = (ggml_backend_sycl_context *)backend->context;
+        const queue_ptr &stream = sycl_ctx->stream(sycl_ctx->device, 0);
+        // device-side wait: order this queue's work after the event without blocking the host
+        // (matches CUDA cudaStreamWaitEvent; the old sycl_event->wait() blocked the host)
+        SYCL_CHECK(CHECK_TRY_ERROR(stream->submit([&](sycl::handler &h) {
+            h.depends_on(*sycl_event);
+        })));
     } else
         GGML_ABORT("fatal error");
 } catch (sycl::exception const& exc) {
