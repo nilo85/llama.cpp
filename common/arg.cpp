@@ -2777,13 +2777,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
-        {"--moe-cache-mib"}, "N",
-        "GPU cache size in MiB for the MoE experts kept in the CPU (default: 0, disabled)",
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("invalid value");
+        {"--moe-cache-mib"}, "N0,N1,...",
+        "per-GPU cache size in MiB for the MoE experts kept in the CPU (default: 0, disabled).\n"
+        "a single value is applied to every GPU, a comma list is applied per GPU, e.g. 8192 or 8192,4096",
+        [](common_params & params, const std::string & value) {
+            std::string arg_next = value;
+            const std::regex regex{ R"([,/]+)" };
+            std::sregex_token_iterator it{ arg_next.begin(), arg_next.end(), regex, -1 };
+            std::vector<std::string> split_arg{ it, {} };
+            if (split_arg.size() > 128) {
+                throw std::invalid_argument("too many values");
             }
-            params.moe_cache_size = (size_t) value*1024*1024;
+            for (size_t i = 0; i < split_arg.size(); ++i) {
+                const int v = std::stoi(split_arg[i]);
+                if (v < 0) {
+                    throw std::invalid_argument("invalid value");
+                }
+                params.moe_cache_size[i] = (size_t) v*1024*1024;
+            }
+            if (split_arg.size() == 1) {
+                // a single value is broadcast to every GPU
+                for (size_t i = split_arg.size(); i < 128; ++i) {
+                    params.moe_cache_size[i] = params.moe_cache_size[0];
+                }
+            }
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(

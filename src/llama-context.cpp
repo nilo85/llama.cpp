@@ -465,19 +465,36 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        if (cparams.moe_cache_size > 0) {
-            if (cparams.pipeline_parallel || model.n_devices() > 1) {
-                throw std::runtime_error("MoE cache does not support multiple devices");
+        if (cparams.moe_cache_size != nullptr) {
+            if (cparams.pipeline_parallel) {
+                throw std::runtime_error("MoE cache does not support pipeline parallelism");
             }
+            // one cache per GPU device, size = moe_cache_size[device index] (0 = no cache on that GPU)
+            size_t n_gpu = 0;
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
                 const auto type = ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[i]));
                 if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                    moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs[i], backend_buft[i], cparams.moe_cache_size);
-                    break;
+                    const size_t sz = cparams.moe_cache_size[n_gpu];
+                    if (sz > 0) {
+                        moe_caches.push_back(std::make_unique<llama_moe_cache>(model, backend_ptrs[i], backend_buft[i], sz));
+                    }
+                    n_gpu++;
                 }
             }
-            if (!moe_cache) {
+            if (n_gpu == 0 && cparams.moe_cache_size[0] > 0) {
                 throw std::runtime_error("MoE cache requires a GPU backend");
+            }
+            // per-layer lookup: the cache whose device owns the layer
+            if (!moe_caches.empty()) {
+                moe_cache_by_layer.assign(model.layers.size(), nullptr);
+                for (auto & mc : moe_caches) {
+                    ggml_backend_dev_t dev = ggml_backend_get_device(mc->backend());
+                    for (size_t il = 0; il < model.layers.size(); ++il) {
+                        if (model.dev_layer(il) == dev) {
+                            moe_cache_by_layer[il] = mc.get();
+                        }
+                    }
+                }
             }
         }
 
@@ -2629,7 +2646,8 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
-        /*.moe_cache   =*/ moe_cache.get(),
+        /*.moe_cache_by_layer =*/ moe_cache_by_layer.data(),
+        /*.moe_cache_n_layer  =*/ (int32_t) moe_cache_by_layer.size(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
@@ -2673,9 +2691,11 @@ ggml_status llama_context::graph_compute(
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
 
-    // the slot maps of the MoE cache
-    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
-        return true;
+    // the slot maps of the MoE cache (each cache only handles the slot maps of its own device)
+    for (auto & mc : lctx->moe_caches) {
+        if (mc->copy(backend, src, dst, graph)) {
+            return true;
+        }
     }
 
     auto & st = lctx->copy_experts;
@@ -2727,8 +2747,14 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
         // the experts in the MoE cache are copied from device memory, the others are uploaded
         int64_t next = first;
-        for (int64_t e = first; e <= last && lctx->moe_cache; ) {
-            const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, last);
+        for (int64_t e = first; e <= last; ) {
+            int64_t n = 0;
+            for (auto & mc : lctx->moe_caches) {
+                n = mc->copy_experts(backend, src, dst, e, last);
+                if (n > 0) {
+                    break;
+                }
+            }
             if (n == 0) {
                 e++;
                 continue;
@@ -3613,8 +3639,8 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
-    if (moe_cache) {
-        for (const auto & [buft, size] : moe_cache->memory_breakdown()) {
+    for (auto & mc : moe_caches) {
+        for (const auto & [buft, size] : mc->memory_breakdown()) {
             ret[buft].context += size;
         }
     }
@@ -3907,7 +3933,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
-        /*.moe_cache_size              =*/ 0,
+        /*.moe_cache_size              =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

@@ -55,7 +55,7 @@ struct llama_cparams {
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
 
-    size_t moe_cache_size;
+    const size_t * moe_cache_size; // per-GPU cache in bytes for the experts kept in host memory, 0 = disabled
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

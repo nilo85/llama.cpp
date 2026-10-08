@@ -795,7 +795,8 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
-    const llama_moe_cache        * moe_cache;
+    const llama_moe_cache        * const * moe_cache_by_layer; // [moe_cache_n_layer], nullptr if the layer is not cached
+    int32_t                       moe_cache_n_layer;
 
     const llama_prec_policy * prec_policy = nullptr;
 
@@ -1039,7 +1040,8 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
-    const llama_moe_cache        * moe_cache;
+    const llama_moe_cache        * const * moe_cache_by_layer;
+    int32_t                       moe_cache_n_layer;
 
     const llama_prec_policy * prec_policy;
 
@@ -1088,7 +1090,8 @@ struct llm_graph_context {
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
               ggml_tensor * w_s   = nullptr,
-              ggml_tensor * slots = nullptr) const;
+              ggml_tensor * slots = nullptr,
+                      int   il    = -1) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,

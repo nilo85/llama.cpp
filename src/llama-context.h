@@ -301,7 +301,8 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
-    llama_moe_cache_ptr moe_cache;
+    std::vector<llama_moe_cache_ptr> moe_caches; // one per GPU device
+    std::vector<const llama_moe_cache *> moe_cache_by_layer; // [n_layer], nullptr if the layer is not cached
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
