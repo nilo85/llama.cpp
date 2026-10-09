@@ -1478,6 +1478,29 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         int src_backend_id = tensor_backend_id(src);
                         if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
                             need_new_split = true;
+                            // investigation: log what arms the weight-reuse split cascade (env-gated, capped)
+                            // GGML_SPLIT_TRIG_NODES=<n> restricts to graphs with that n_nodes
+                            static bool   split_trig_log      = getenv("GGML_SPLIT_LOG_SPLIT") != nullptr;
+                            static int    split_trig_nodes    = -1;
+                            static int    split_trig_count    = 0;
+                            static int    split_trig_last_n   = -1;
+                            if (split_trig_log) {
+                                if (split_trig_nodes < 0) {
+                                    const char * tn = getenv("GGML_SPLIT_TRIG_NODES");
+                                    if (tn) { split_trig_nodes = atoi(tn); }
+                                }
+                                if (split_trig_nodes < 0 || graph->n_nodes == split_trig_nodes) {
+                                    if (split_trig_nodes >= 0 && graph->n_nodes != split_trig_last_n) {
+                                        split_trig_last_n = graph->n_nodes;
+                                        split_trig_count    = 0;
+                                    }
+                                    if (split_trig_count < 80) {
+                                        split_trig_count++;
+                                        GGML_LOG_INFO("[SPLITTRIG] graph n_nodes=%d | node#%d op=%s cur_be=%d n_inputs=%d | weight src_j=%d name=%.40s be=%d\n",
+                                                      graph->n_nodes, i, ggml_op_name(node->op), cur_backend_id, split->n_inputs, j, src->name, src_backend_id);
+                                    }
+                                }
+                            }
                             break;
                         }
                     }
@@ -1862,6 +1885,90 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+
+    // investigation: print the split structure once per unique graph shape
+    // (env-gated; one static read per call when unset, zero log output)
+    static bool split_log = getenv("GGML_SPLIT_LOG") != nullptr;
+    static int  split_log_last_nodes = -1;
+    static int  split_seq_count = 0;
+    if (split_log && split_seq_count < 40) {
+        split_seq_count++;
+        GGML_LOG_INFO("[SPLITSEQ] n_nodes=%d n_splits=%d\n", sched->graph.n_nodes, sched->n_splits);
+    }
+    if (split_log && sched->graph.n_nodes != split_log_last_nodes) {
+        split_log_last_nodes = sched->graph.n_nodes;
+        GGML_LOG_INFO("[SPLITLOG] n_nodes=%d n_splits=%d n_backends=%d\n",
+                      sched->graph.n_nodes, sched->n_splits, sched->n_backends);
+        for (int i = 0; i < sched->n_splits; i++) {
+            const struct ggml_tensor * first = sched->graph.nodes[sched->splits[i].i_start];
+            GGML_LOG_INFO("[SPLITLOG]   split#%d backend=%d nodes=[%d,%d) count=%d inputs=%d op0=%s\n",
+                          i, sched->splits[i].backend_id, sched->splits[i].i_start, sched->splits[i].i_end,
+                          sched->splits[i].i_end - sched->splits[i].i_start, sched->splits[i].n_inputs,
+                          first ? ggml_op_name(first->op) : "?");
+        }
+        // optional: per-node detail (op + backend + src backends) for a node range,
+        // to see which weight/activation location pins an op to a device
+        const char * ops_env = getenv("GGML_SPLIT_LOG_OPS");
+        if (ops_env) {
+            int lo = 0, hi = sched->graph.n_nodes;
+            if (sscanf(ops_env, "%d,%d", &lo, &hi) != 2) { hi = sched->graph.n_nodes; }
+            for (int i = lo; i < hi && i < sched->graph.n_nodes; i++) {
+                struct ggml_tensor * n = sched->graph.nodes[i];
+                if (n == nullptr) { continue; }
+                int be = -1;
+                for (int s = 0; s < sched->n_splits; s++) {
+                    if (i >= sched->splits[s].i_start && i < sched->splits[s].i_end) { be = sched->splits[s].backend_id; break; }
+                }
+                auto src_be = [&](int j) -> int {
+                    struct ggml_tensor * src = (j < GGML_MAX_SRC) ? n->src[j] : nullptr;
+                    if (src == nullptr) { return -1; }
+                    ggml_backend_t sb = ggml_backend_sched_get_tensor_backend(sched, src);
+                    if (sb == nullptr) { return -1; }
+                    for (int k = 0; k < sched->n_backends; k++) { if (sched->backends[k] == sb) { return k; } }
+                    return -1;
+                };
+                GGML_LOG_INFO("[SPLITLOG]   node#%d be=%d op=%s src0(be=%d)=%s src1(be=%d)=%s\n",
+                              i, be, ggml_op_name(n->op),
+                              src_be(0), n->src[0] ? ggml_op_name(n->src[0]->op) : "-",
+                              src_be(1), n->src[1] ? ggml_op_name(n->src[1]->op) : "-");
+            }
+        }
+    }
+
+    // investigation: run-length of the ACTUAL per-node backend for a graph, to find the
+    // off-backend node that splits a same-backend segment (env-gated; GGML_NODEBACKEND_NODES=<n>)
+    static bool node_be_log = getenv("GGML_NODEBACKEND") != nullptr;
+    static int  node_be_nodes = -1;
+    static int  node_be_last = -1;
+    if (node_be_log) {
+        if (node_be_nodes < 0) {
+            const char * nn = getenv("GGML_NODEBACKEND_NODES");
+            if (nn) { node_be_nodes = atoi(nn); }
+        }
+        if ((node_be_nodes < 0 || sched->graph.n_nodes == node_be_nodes) && sched->graph.n_nodes != node_be_last) {
+            node_be_last = sched->graph.n_nodes;
+            GGML_LOG_INFO("[NODEBE] n_nodes=%d (run-length of actual per-node backend)\n", sched->graph.n_nodes);
+            int prev_be = -2;
+            int run_start = 0;
+            for (int i = 0; i <= sched->graph.n_nodes; i++) {
+                int be = -1;
+                if (i < sched->graph.n_nodes) {
+                    struct ggml_tensor * n = sched->graph.nodes[i];
+                    if (n) {
+                        be = tensor_backend_id(n);
+                        if (be == -1 && n->view_src) { be = tensor_backend_id(n->view_src); }
+                    }
+                }
+                if (i == sched->graph.n_nodes || be != prev_be) {
+                    if (prev_be != -2) {
+                        GGML_LOG_INFO("[NODEBE]   nodes[%d,%d) be=%d count=%d\n", run_start, i, prev_be, i - run_start);
+                    }
+                    prev_be = be;
+                    run_start = i;
+                }
+            }
+        }
+    }
 
     int prev_backend_id = -1;
 
